@@ -8,7 +8,7 @@ or internet radio.
 - 13 log-spaced bands from 40 Hz to 16 kHz (bass on the left)
 - Bars with fast attack and smooth fall
 - Peak dots that hold for ~0.5 s, then drop
-- 25 fps, a few percent of one CPU core
+- 25 fps, under 10% of one CPU core
 - Never affects playback: if the analyzer stops, MPD just keeps playing
 
 ## How it works
@@ -113,6 +113,7 @@ All settings are constants at the top of `python/main.py`:
 | `PEAK_FALL` | `0.15` | How fast peak dots drop, rows per frame |
 | `BAR_BRIGHT` | `7` | Bar brightness, 0..7 |
 | `PEAK_BRIGHT` | `4` | Peak dot brightness, 0..7 |
+| `PROFILE` | `False` | Print per-stage timings (read, FFT, render, bridge) every 5 s |
 
 ## Limitations
 
