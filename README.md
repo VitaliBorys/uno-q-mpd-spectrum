@@ -21,7 +21,7 @@ MPD ──► main audio output (DAC) ──► amplifier
          ▼
    python/main.py  (Linux side, App Lab container)
    reads PCM → FFT → 13 bands → 104-byte frame
-         │  Bridge.call("draw", frame)
+         │  Bridge.notify("draw", frame)
          ▼
    sketch/sketch.ino  (STM32 MCU)
    matrix.draw(frame) → LED matrix
