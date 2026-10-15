@@ -1,0 +1,10 @@
+# MPD FIFO lives here on the board; it is created by hand, not committed
+viz/
+
+# Python virtual environment and caches created by App Lab
+.cache/
+__pycache__/
+*.pyc
+
+# App Lab runtime data
+data/
