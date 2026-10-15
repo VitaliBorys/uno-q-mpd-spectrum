@@ -1,5 +1,7 @@
 # MPD Spectrum Analyzer for Arduino UNO Q
 
+![UNO Q spectrum analyzer with ZK-QCC DAC and TPA3116 amplifier](docs/setup.jpg)
+
 A 13-band audio spectrum analyzer for the built-in 8×13 LED matrix of the
 [Arduino UNO Q](https://www.arduino.cc/product-uno-q), driven by whatever
 [MPD](https://www.musicpd.org) is playing — CDs, FLAC/WAV files, CUE images
