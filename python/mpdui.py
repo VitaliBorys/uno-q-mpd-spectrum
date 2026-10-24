@@ -220,16 +220,23 @@ def fit(text, limit):
     return text.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
 
 
-def describe_format(song, status):
-    """Header text: "FLAC 16/44", "FLAC 24/96", "CD 16/44", "MP3 320"..."""
-    path = song.get("file", "")
+def extension(path):
     name = path.rsplit("/", 1)[-1]
-    if path.startswith(("http://", "https://")):
+    return name.rsplit(".", 1)[-1].upper() if "." in name else ""
+
+
+def describe_format(song, status, codec=None):
+    """Header text: "FLAC 16/44", "FLAC 24/96", "CD 16/44", "MP3 320"...
+    `codec` overrides the guess from the file name (tracks of a CUE sheet)."""
+    path = song.get("file", "")
+    if codec is not None:
+        pass
+    elif path.startswith(("http://", "https://")):
         codec = "FLAC" if "flac" in path.lower() else ""
     elif path.startswith("cdda://"):
         codec = "CD"
     else:
-        codec = name.rsplit(".", 1)[-1].upper() if "." in name else ""
+        codec = extension(path)
 
     rate, bits = 0, ""
     parts = status.get("audio", "").split(":")
@@ -244,15 +251,17 @@ def describe_format(song, status):
         khz = rate // 1000
         return f"{codec} {bits}/{khz}" if bits.isdigit() else f"{codec} {khz}k"
     bitrate = status.get("bitrate", "0")
-    if bitrate not in ("", "0"):
-        return f"{codec} {bitrate}".strip()
+    if codec and bitrate not in ("", "0"):
+        return f"{codec} {bitrate}"
+    if bits.isdigit() and rate:                  # codec unknown: at least 16/44
+        return f"{bits}/{rate // 1000}"
     return codec
 
 
-def describe_track(song, status, radio):
+def describe_track(song, status, radio, codec=None):
     """Everything the trk message carries, as a tuple."""
     path = song.get("file", "")
-    fmt = describe_format(song, status)
+    fmt = describe_format(song, status, codec)
     if not path:
         return ("MPD", "", "", "", "", 0, 0, 0, 0, 0)
 
@@ -314,6 +323,7 @@ class Controller:
         self.send = send             # send(name, *args), thread-safe
         self.radio = load_radio()
         self.library = Library()
+        self.cue_codecs = {}         # CUE sheet path -> codec of its audio file
         self.mpd = Mpd()             # commands and status (shared, under lock)
         self.lock = threading.Lock()
         self.events = queue.Queue()
@@ -343,7 +353,8 @@ class Controller:
         with self.lock:
             status = self.mpd.command("status")
             song = self.mpd.command("currentsong")
-        trk = describe_track(song, status, self.radio)
+            codec = self._cue_codec(song.get("file", ""))
+        trk = describe_track(song, status, self.radio, codec)
         if force or trk != self.last_trk:
             src, fmt, artist, title, album, *nums = trk
             self.send("trk", fit(src, LIMITS["src"]), fit(fmt, LIMITS["fmt"]),
@@ -352,6 +363,22 @@ class Controller:
             self.last_trk = trk
         self.send("st", *describe_status(status))
         return status
+
+    def _cue_codec(self, path):
+        """Tracks of a CUE sheet look like "Album/album.cue/track0003": no
+        extension to go by. The audio file sits next to the sheet, usually
+        with the same name; look it up once per folder. Call under the lock."""
+        if ".cue/" not in path.lower():
+            return None
+        cue = path[:path.lower().index(".cue/") + 4]
+        if cue not in self.cue_codecs:
+            folder, _, sheet = cue.rpartition("/")
+            stem = sheet[:-4].casefold()
+            files = [v for k, v in self.mpd.lines(f"lsinfo {quote(folder)}") if k == "file"]
+            audio = [f for f in files if extension(f) not in ("", "CUE", "LOG", "TXT", "JPG", "PNG")]
+            same = [f for f in audio if f.rsplit("/", 1)[-1].casefold().startswith(stem + ".")]
+            self.cue_codecs[cue] = extension((same or audio or [""])[0])
+        return self.cue_codecs[cue]
 
     def push_clock(self, force=False):
         minute = local_minutes()
