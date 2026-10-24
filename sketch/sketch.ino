@@ -11,7 +11,7 @@
 //     turn            volume
 //     press + turn    switch view
 //     short press     play / pause
-//     long press      next track
+//     hold 1 s        next track, then one more every second while held
 //     K0              open the menu
 //   Menu:
 //     turn            move
@@ -62,7 +62,8 @@
 // ---- Settings ----------------------------------------------------------
 const int STEPS_PER_DETENT = 4;
 const bool REVERSE = false;
-const unsigned long HOLD_MS = 600;     // long press
+const unsigned long HOLD_MS = 1000;    // hold this long: next track (fires while held)
+const unsigned long REPEAT_MS = 1000;  // ...and again every this long
 const unsigned long DEBOUNCE_MS = 25;
 const unsigned long FRAME_MS = 33;     // animation: ~30 fps
 const bool BUTTON_IRQ = true;          // false = poll buttons only
@@ -1440,9 +1441,14 @@ void menuLong() {
 // ---- Input handling --------------------------------------------------------
 bool logicDown = false;
 uint16_t pressesDone = 0, releasesDone = 0, k0Done = 0;
+int holdCount = 0;               // hold actions fired during the current press
 
 void onShort() { if (inMenu) menuSelect(); else sendCmd(CMD_TOGGLE); }
-void onLong()  { if (inMenu) menuLong();   else sendCmd(CMD_NEXT); }
+// n = 1 after HOLD_MS, 2 after another REPEAT_MS, ...
+void onHold(int n) {
+  if (inMenu) { if (n == 1) menuLong(); }
+  else sendCmd(CMD_NEXT);
+}
 void onK0()    { if (inMenu) menuBack();   else menuEnter(); }
 
 void handleInput() {
@@ -1486,14 +1492,20 @@ void handleInput() {
     if (!logicDown && pressesDone != pc) {
       pressesDone++;
       logicDown = true;
+      holdCount = 0;
     } else if (logicDown && releasesDone != rc) {
       releasesDone++;
       logicDown = false;
       if (swallowRelease) swallowRelease = false;
-      else if (!turned) {
-        if (rAt - pAt >= HOLD_MS) onLong(); else onShort();
-      }
+      else if (!turned && holdCount == 0 && rAt - pAt < HOLD_MS) onShort();
     } else break;
+  }
+
+  // Held down (and not turning): act while still held, then repeat.
+  if (logicDown && pushDown && !turned && !swallowRelease &&
+      millis() - pAt >= HOLD_MS + (unsigned long)holdCount * REPEAT_MS) {
+    holdCount++;
+    onHold(holdCount);
   }
 
   while (k0Done != kc) { k0Done++; onK0(); }
