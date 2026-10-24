@@ -838,7 +838,13 @@ void takeLevels() {
 
 // ---- Marquee: a long title swings left to its end and back ---------------
 // Stands 2 s at each end, moves 3 px every 60 ms (~50 px/s). One step
-// redraws just the title box.
+// redraws just the glyph rows of the title.
+//
+// Drawn in vertical strips, left to right. The panel is a portrait one
+// turned on its side, so it refreshes our picture column by column. A box
+// sent row by row (top to bottom) would cross that refresh: the top of the
+// letters already moved, the bottom not yet - a comb through the text.
+// Strips sent along the refresh direction leave at most one vertical seam.
 const unsigned long MQ_HOLD_MS = 2000, MQ_STEP_MS = 60;
 const int MQ_PX = 3;
 Marquee mq;
@@ -847,17 +853,19 @@ void marqueeSetup() {
   mq.on = false;
   if (inMenu || idle) return;
   int x, y, w, h, padY, size;
-  if (view == V_NOW) { x = 8; y = 46; w = 304; h = 28; padY = 2; size = 3; }
+  if (view == V_NOW) { x = 8; y = 48; w = 304; h = 24; padY = 0; size = 3; }
   else if (view == V_EYE) {
     char l1[80], l2[80];
     eyeTitle(l1, l2, sizeof(l1));
     if (l2[0]) return;                         // fits on two lines
-    x = EYE_TX; y = 46; w = EYE_TW; h = 18; padY = 1; size = 2;
+    x = EYE_TX; y = 47; w = EYE_TW; h = 16; padY = 0; size = 2;
   } else return;
   int textW = u8len(now.title) * 6 * size - size;   // the last glyph column is blank
   if (textW <= w) return;
   mq = {true, x, y, w, h, padY, (uint8_t)size, textW - w, 0, 0, millis()};
 }
+
+void marqueeDraw();
 
 void marqueeStep() {
   if (!mq.on) return;
@@ -870,7 +878,30 @@ void marqueeStep() {
   mq.at = t;
   if (mq.phase == 1) { mq.off = imin(mq.maxOff, mq.off + MQ_PX); if (mq.off == mq.maxOff) mq.phase = 2; }
   else               { mq.off = imax(0, mq.off - MQ_PX);         if (mq.off == 0) mq.phase = 0; }
-  textBoxAt(mq.x, mq.y, mq.w, mq.h, 0, mq.padY, now.title, mq.size, VFD, BLACK, mq.off);
+  marqueeDraw();
+}
+
+void marqueeDraw() {
+  const uint8_t *gl[72];
+  int len = decodeGlyphs(now.title, gl, 72);
+  const int SW = 8;                            // strip width, px
+  for (int sx = 0; sx < mq.w; sx += SW) {
+    int sw = imin(SW, mq.w - sx);
+    uint16_t *p = pbuf;
+    for (int r = 0; r < mq.h; r++) {
+      int gy = (r - mq.padY) / mq.size;
+      for (int c = sx; c < sx + sw; c++) {
+        int gx = (c + mq.off) / mq.size;
+        int ch = gx / 6, col = gx % 6;
+        bool on = r >= mq.padY && gy < 8 && ch < len && col < 5 && ((gl[ch][col] >> gy) & 1);
+        *p++ = on ? VFD : BLACK;
+      }
+    }
+    tft.startWrite();
+    tft.window(mq.x + sx, mq.y, mq.x + sx + sw - 1, mq.y + mq.h - 1);
+    tft.sendPixels(pbuf, (size_t)sw * mq.h);
+    tft.endWrite();
+  }
 }
 
 // ---- Erasing a view: only what it drew, not the whole area ----------------
