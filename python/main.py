@@ -1,16 +1,22 @@
 """
-MPD spectrum analyzer for the Arduino UNO Q 8x13 LED matrix.
+MPD spectrum analyzer and controller for the Arduino UNO Q.
 
-Reads raw PCM from an MPD FIFO output, runs an FFT, folds the spectrum
-into 13 log-spaced bands and sends a 104-byte grayscale frame to the
-MCU over the Router Bridge.
+Reads raw PCM from an MPD FIFO output and runs an FFT. Each frame:
+- the LED matrix gets a 104-byte grayscale frame (13 log-spaced bands);
+- the TFT gets 16 bands plus left/right levels for its spectrum, VU meters
+  and magic eye (the sketch does the drawing and the needle physics).
+mpdui.py keeps the TFT's "now playing" screen in sync with MPD and turns
+the knob and buttons into MPD commands.
 """
 
 import os
+import threading
 import time
 
 import numpy as np
 from arduino.app_utils import App, Bridge
+
+from mpdui import Controller
 
 # --- Input -----------------------------------------------------------------
 FIFO = "/app/viz/mpd.fifo"   # MPD FIFO; the app folder is mounted at /app
@@ -29,6 +35,10 @@ BAR_BRIGHT = 7               # bar brightness (0..7)
 PEAK_BRIGHT = 4              # peak dot brightness (0..7)
 
 PROFILE = False              # print per-stage timings to the Python Shell every 5 s
+
+# --- TFT -------------------------------------------------------------------
+TFT_BANDS = 16               # spectrum bars on the TFT, 31 Hz .. 16 kHz
+VU_REF_DBFS = -18.0          # level that reads 0 VU (a common digital reference)
 
 # --- Setup -----------------------------------------------------------------
 # Non-blocking read so the loop keeps running while MPD is paused or stopped.
@@ -54,6 +64,17 @@ for lo, hi in zip(edges[:-1], edges[1:]):
 maxlen = max(len(b) for b in bands)
 band_idx = np.array([np.pad(b, (0, maxlen - len(b)), mode="edge") for b in bands])
 
+# Same thing for the TFT's 16 bands.
+tft_edges = np.geomspace(31, 16000, TFT_BANDS + 1)
+tft_bands = []
+for lo, hi in zip(tft_edges[:-1], tft_edges[1:]):
+    idx = np.where((freqs >= lo) & (freqs < hi))[0]
+    if len(idx) == 0:
+        idx = np.array([np.argmin(np.abs(freqs - (lo + hi) / 2))])
+    tft_bands.append(idx)
+tft_maxlen = max(len(b) for b in tft_bands)
+tft_band_idx = np.array([np.pad(b, (0, tft_maxlen - len(b)), mode="edge") for b in tft_bands])
+
 # Row numbers as a column vector, broadcast against per-column heights.
 ROW = np.arange(ROWS)[:, None]
 
@@ -62,6 +83,16 @@ peaks = np.zeros(COLS)       # current peak dot heights
 peak_age = np.zeros(COLS)    # frames since each peak was last pushed up
 last_data = 0.0              # time of the last audio received
 last_frame = None            # last frame sent, to skip duplicates
+rms_lr = np.zeros(2)         # left/right RMS of the latest audio, 0..1
+last_levels = None           # last lv message, to skip repeated silence
+
+# Bridge.notify is called from several threads (this loop, mpdui): one at a time.
+bridge_lock = threading.Lock()
+
+
+def send(name, *args):
+    with bridge_lock:
+        Bridge.notify(name, *args)
 
 prof = {"read": 0.0, "fft": 0.0, "render": 0.0, "bridge": 0.0}
 prof_frames = 0
@@ -84,8 +115,9 @@ def report():
 
 
 def read_audio():
-    """Drain the FIFO and keep the most recent N mono samples in `buf`."""
-    global pending, buf, last_data
+    """Drain the FIFO, keep the most recent N mono samples in `buf` and the
+    left/right RMS of the newest audio in `rms_lr`."""
+    global pending, buf, last_data, rms_lr
     while True:
         try:
             chunk = os.read(fd, 65536)
@@ -103,6 +135,8 @@ def read_audio():
     data = np.frombuffer(pending[:usable], dtype="<i2").astype(np.float32)
     pending = pending[usable:]
     mono = (data[0::2] + data[1::2]) / 65536.0  # L+R mix, scaled to -1..1
+    recent = data[-N * 2:] / 32768.0            # last ~46 ms, interleaved L R
+    rms_lr = np.sqrt(np.mean(recent.reshape(-1, 2) ** 2, axis=0))
 
     if len(mono) >= N:
         buf = mono[-N:]
@@ -112,11 +146,19 @@ def read_audio():
 
 
 def spectrum():
-    """Return the target height of each band, 0..ROWS."""
+    """Matrix band heights (0..ROWS) and TFT band levels (0..1)."""
     spec = np.abs(np.fft.rfft(buf * window)) / norm
-    out = spec[band_idx].max(axis=1)
-    db = 20 * np.log10(out + 1e-9)
-    return np.clip((db - FLOOR_DB) / -FLOOR_DB * ROWS, 0, ROWS)
+    db = 20 * np.log10(spec[band_idx].max(axis=1) + 1e-9)
+    db_tft = 20 * np.log10(spec[tft_band_idx].max(axis=1) + 1e-9)
+    return (np.clip((db - FLOOR_DB) / -FLOOR_DB * ROWS, 0, ROWS),
+            np.clip((db_tft - FLOOR_DB) / -FLOOR_DB, 0, 1))
+
+
+def vu_position(rms):
+    """Needle position 0..1 on the sketch's scale: -20..0 VU takes the first
+    65 % of the swing, 0..+3 VU the rest (like a real VU meter, roughly)."""
+    vu = 20 * np.log10(rms + 1e-9) - VU_REF_DBFS
+    return np.where(vu <= 0, (vu + 20) / 20 * 0.65, 0.65 + vu / 3 * 0.35).clip(0, 1)
 
 
 def render():
@@ -131,7 +173,7 @@ def render():
 
 
 def loop():
-    global levels, peaks, peak_age, last_frame, prof_frames, prof_sends
+    global levels, peaks, peak_age, last_frame, last_levels, prof_frames, prof_sends
     start = time.monotonic()
 
     read_audio()
@@ -139,8 +181,10 @@ def loop():
 
     if t_read - last_data > 0.5:
         target = np.zeros(COLS)              # silence: let everything fall
+        tft_levels = np.zeros(TFT_BANDS + 2)
     else:
-        target = spectrum()
+        target, tft = spectrum()
+        tft_levels = np.concatenate((tft, vu_position(rms_lr)))
     t_fft = time.monotonic()
 
     # Bars: jump up instantly, fall smoothly.
@@ -158,9 +202,14 @@ def loop():
 
     if frame != last_frame:
         # notify = fire-and-forget: no waiting for the MCU to reply (~16 ms saved)
-        Bridge.notify("draw", frame)
+        send("draw", frame)
         last_frame = frame
         prof_sends += 1
+
+    lv = (tft_levels * 255).astype(np.uint8).tobytes()
+    if lv != last_levels:                    # silence is sent once, not 25 times a second
+        send("lv", lv)
+        last_levels = lv
     t_bridge = time.monotonic()
 
     if PROFILE:
@@ -174,5 +223,11 @@ def loop():
 
     time.sleep(max(0.0, 1 / FPS - (time.monotonic() - start)))
 
+
+# Knob and buttons: the sketch notifies, the controller talks to MPD.
+controller = Controller(send)
+Bridge.provide("vol", controller.on_vol)
+Bridge.provide("cmd", controller.on_cmd)
+Bridge.provide("hello", controller.on_hello)
 
 App.run(user_loop=loop)

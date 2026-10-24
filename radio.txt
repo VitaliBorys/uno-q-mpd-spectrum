@@ -1,0 +1,6 @@
+# Radio stations for the menu: one per line, "Name | stream URL".
+# The "flacm" streams carry the song titles, so the screen shows them.
+Radio Paradise Main     | http://stream.radioparadise.com/flacm
+Radio Paradise Mellow   | http://stream.radioparadise.com/mellow-flacm
+Radio Paradise Rock     | http://stream.radioparadise.com/rock-flacm
+Radio Paradise Global   | http://stream.radioparadise.com/global-flacm
