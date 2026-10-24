@@ -3,10 +3,13 @@ MPD side of the physical controller (TFT + knob + buttons on the MCU).
 
 - Watches MPD with the `idle` command and pushes what is playing to the MCU:
     trk(src, fmt, artist, title, album, year, no, of, dur, radio)
-    st(state, elapsed, volume, repeat, random)
+    st(state, elapsed, volume, repeat, random, song)
     clk(minutes since midnight)
 - Turns knob and button events from the MCU into MPD commands:
     vol(clicks)   cmd(code)   hello()
+- Serves the menu one page at a time:
+    get(list, ctx, start)         -> page(list, ctx, start, total) + item(list, ctx, i, text)...
+    sel(list, ctx, index, action) -> play it (action 0) or add it to the queue (1)
 
 MPD runs on the host, outside the App Lab container, so it is reached
 through the container's default gateway (the host side of the Docker
@@ -37,6 +40,12 @@ REFRESH_S = 5                # re-send the status this often while playing
 
 # Button codes sent by the sketch (must match sketch.ino)
 CMD_TOGGLE, CMD_NEXT, CMD_PREV = 1, 2, 3
+
+# Menu lists (must match the sketch's enum)
+L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD = 1, 2, 3, 4, 5, 6
+PAGE = 8                     # rows on the screen
+ITEM_LIMIT = 64              # bytes per menu row
+CURRENT = "\x10"             # glyph 16 in the sketch's font: a small play triangle
 
 # Field limits in bytes. One Bridge message must fit in 256 bytes.
 LIMITS = {"src": 7, "fmt": 15, "artist": 44, "title": 64, "album": 52}
@@ -88,21 +97,22 @@ class Mpd:
         self.sock = self.rfile = None
 
     def _send(self, cmd):
+        """Send a command, return the response as a list of (key, value)."""
         self.sock.sendall((cmd + "\n").encode())
-        result = {}
+        pairs = []
         while True:
             line = self.rfile.readline()
             if not line:
                 raise ConnectionError("connection closed")
             line = line.rstrip("\n")
             if line == "OK":
-                return result
+                return pairs
             if line.startswith("ACK"):
                 raise RuntimeError(line)
             key, _, value = line.partition(": ")
-            result.setdefault(key, value)     # first value wins (e.g. one "file:")
+            pairs.append((key, value))
 
-    def command(self, cmd):
+    def lines(self, cmd):
         """Run one command; reconnect and retry once if the link dropped."""
         for attempt in (1, 2):
             try:
@@ -114,9 +124,83 @@ class Mpd:
                 if attempt == 2:
                     raise
 
+    def command(self, cmd):
+        """Run one command; the response as a dict (first value of each key)."""
+        result = {}
+        for key, value in self.lines(cmd):
+            result.setdefault(key, value)
+        return result
+
+    def batch(self, cmds):
+        """Several commands in one round trip (command_list_begin/end)."""
+        if cmds:
+            self.lines("command_list_begin\n" + "\n".join(cmds) + "\ncommand_list_end")
+
+
+def quote(text):
+    """An MPD protocol argument: in double quotes, with \\ and \" escaped."""
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def records(pairs, start_key="file"):
+    """Split a flat MPD response into dicts, one per song."""
+    out, cur = [], None
+    for key, value in pairs:
+        if key == start_key:
+            cur = {key: value}
+            out.append(cur)
+        elif key in ("directory", "playlist"):
+            cur = None
+        elif cur is not None:
+            cur.setdefault(key, value)
+    return out
+
+
+def number(text):
+    """Leading integer of "3", "3/12", "1997-05-01"; 0 if none."""
+    m = re.match(r"\d+", text or "")
+    return int(m.group()) if m else 0
+
+
+class Library:
+    """Artists and albums from MPD's database, grouped by AlbumArtist
+    (falling back to Artist), sorted case-insensitively. Reloaded when MPD
+    reports a database update."""
+
+    def __init__(self):
+        self.artists = []          # names
+        self.by_artist = {}        # name -> [album, ...] sorted by year
+        self.albums = []           # every album, sorted by name
+
+    def load(self, mpd):
+        groups = {}
+        for song in records(mpd.lines("listallinfo")):
+            path = song["file"]
+            artist = song.get("AlbumArtist") or song.get("Artist") or "Unknown artist"
+            folder = path.rsplit("/", 2)[-2] if "/" in path else "Unknown album"
+            album = song.get("Album") or folder      # untagged files: group by folder
+            key = (artist, album)
+            entry = groups.setdefault(key, {"name": album, "artist": artist, "year": 0, "files": []})
+            year = number(song.get("Date"))
+            if year and (not entry["year"] or year < entry["year"]):
+                entry["year"] = year
+            entry["files"].append((number(song.get("Disc")), number(song.get("Track")), path))
+        for entry in groups.values():
+            entry["files"] = [f for _, _, f in sorted(entry["files"])]
+        fold = str.casefold
+        self.albums = sorted(groups.values(), key=lambda a: (fold(a["name"]), fold(a["artist"])))
+        self.by_artist = {}
+        for a in groups.values():
+            self.by_artist.setdefault(a["artist"], []).append(a)
+        for albums in self.by_artist.values():
+            albums.sort(key=lambda a: (a["year"] or 9999, fold(a["name"])))
+        self.artists = sorted(self.by_artist, key=fold)
+        print(f"[mpdui] library: {len(self.artists)} artists, {len(self.albums)} albums")
+
 
 def load_radio(path=RADIO_FILE):
-    """radio.txt: one station per line, "Name | URL". Returns {url: name}."""
+    """radio.txt: one station per line, "Name | URL". Returns {url: name}
+    in file order."""
     stations = {}
     try:
         with open(path, encoding="utf-8") as f:
@@ -207,8 +291,9 @@ def describe_status(status):
         volume = int(status.get("volume", -1))
     except ValueError:
         volume = -1
+    song = int(status["song"]) if status.get("song", "").isdigit() else -1
     return (state, elapsed, volume, int(status.get("repeat", 0) == "1"),
-            int(status.get("random", 0) == "1"))
+            int(status.get("random", 0) == "1"), song)
 
 
 def local_minutes():
@@ -228,6 +313,7 @@ class Controller:
     def __init__(self, send):
         self.send = send             # send(name, *args), thread-safe
         self.radio = load_radio()
+        self.library = Library()
         self.mpd = Mpd()             # commands and status (shared, under lock)
         self.lock = threading.Lock()
         self.events = queue.Queue()
@@ -245,6 +331,12 @@ class Controller:
 
     def on_hello(self):
         self.events.put(("hello", 0))
+
+    def on_get(self, lst, ctx, start):
+        self.events.put(("get", (int(lst), int(ctx), int(start))))
+
+    def on_sel(self, lst, ctx, index, action):
+        self.events.put(("sel", (int(lst), int(ctx), int(index), int(action))))
 
     # --- State push ---
     def push(self, force=False):
@@ -274,7 +366,10 @@ class Controller:
         while True:
             try:
                 self.push(force=self.last_trk is None)
-                conn.command("idle player mixer options")
+                changed = [v for k, v in conn.lines("idle player mixer options database")
+                           if k == "changed"]
+                if "database" in changed:
+                    self.events.put(("reload", 0))
             except Exception as exc:
                 print(f"[mpdui] watch: {exc}")
                 conn.close()
@@ -299,6 +394,7 @@ class Controller:
             time.sleep(1)
 
     def _work(self):
+        self.events.put(("reload", 0))
         while True:
             kind, value = self.events.get()
             if kind == "vol":                # a fast turn: add up queued clicks
@@ -321,6 +417,13 @@ class Controller:
                     self.radio = load_radio()
                     self.push(force=True)
                     self.push_clock(force=True)
+                elif kind == "reload":
+                    with self.lock:
+                        self.library.load(self.mpd)
+                elif kind == "get":
+                    self._page(*value)
+                elif kind == "sel":
+                    self._select(*value)
             except Exception as exc:     # keep the worker alive whatever happens
                 print(f"[mpdui] MPD at {self.mpd.host}:{self.mpd.port}: {exc}")
                 time.sleep(0.5)
@@ -331,6 +434,74 @@ class Controller:
             if volume < 0:
                 return                       # no mixer configured in MPD
             self.mpd.command(f"setvol {max(0, min(100, volume + clicks * VOLUME_STEP))}")
+
+    # --- Menu ---
+    def _rows(self, lst, ctx):
+        """All rows of a list, as text."""
+        lib = self.library
+        if lst == L_QUEUE:
+            with self.lock:
+                songs = records(self.mpd.lines("playlistinfo"))
+                current = self.mpd.command("status").get("song", "")
+            rows = []
+            for i, song in enumerate(songs):
+                path = song["file"]
+                if path.startswith(("http://", "https://")):
+                    text = self.radio.get(path) or song.get("Name") or path
+                else:
+                    artist, title = song.get("Artist", ""), song.get("Title", "")
+                    text = (f"{artist} - {title}" if artist and title
+                            else title or os.path.splitext(path.rsplit("/", 1)[-1])[0])
+                rows.append((CURRENT if str(i) == current else " ") + text)
+            return rows
+        if lst == L_ARTISTS:
+            return lib.artists
+        if lst == L_ARTIST_ALBUMS:
+            albums = lib.by_artist.get(lib.artists[ctx], []) if ctx < len(lib.artists) else []
+            return [a["name"] for a in albums]
+        if lst == L_ALBUMS:
+            return [a["name"] for a in lib.albums]
+        if lst == L_RADIO:
+            with self.lock:
+                playing = self.mpd.command("currentsong").get("file", "")
+            return [(CURRENT if url == playing else " ") + name for url, name in self.radio.items()]
+        return []
+
+    def _page(self, lst, ctx, start):
+        rows = self._rows(lst, ctx)
+        self.send("page", lst, ctx, start, len(rows))
+        for i in range(start, min(start + PAGE, len(rows))):
+            self.send("item", lst, ctx, i, fit(rows[i], ITEM_LIMIT))
+
+    def _files(self, lst, ctx, index):
+        """Files (or stream URLs) behind a menu row."""
+        lib = self.library
+        if lst == L_ARTISTS and index < len(lib.artists):
+            return [f for a in lib.by_artist[lib.artists[index]] for f in a["files"]]
+        if lst == L_ARTIST_ALBUMS and ctx < len(lib.artists):
+            albums = lib.by_artist.get(lib.artists[ctx], [])
+            return albums[index]["files"] if index < len(albums) else []
+        if lst == L_ALBUMS and index < len(lib.albums):
+            return lib.albums[index]["files"]
+        if lst == L_RADIO:
+            urls = list(self.radio)
+            return [urls[index]] if index < len(urls) else []
+        return []
+
+    def _select(self, lst, ctx, index, action):
+        with self.lock:
+            if lst == L_QUEUE:
+                if action == 0:
+                    self.mpd.command(f"play {index}")
+                return
+            files = self._files(lst, ctx, index)
+            if not files:
+                return
+            adds = [f"add {quote(f)}" for f in files]
+            if action == 0:                  # replace the queue and play
+                self.mpd.batch(["clear"] + adds + ["play 0"])
+            else:                            # add to the end, keep playing
+                self.mpd.batch(adds)
 
     def _command(self, code):
         with self.lock:

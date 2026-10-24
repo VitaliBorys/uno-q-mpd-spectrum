@@ -16,13 +16,17 @@
 //   Menu:
 //     turn            move
 //     press + turn    jump a page
-//     short press     open
+//     short press     open / play (an album or station replaces the queue)
+//     hold 1 s        add to the end of the queue
 //     K0              back (from the top level: back to the view)
 //   After a minute without playback the screen shows the "digital rain".
 //
 // Messages (Router Bridge)
 //   Python -> MCU: draw(frame) trk(...) st(...) lv(levels) clk(minutes)
+//                  page(list, ctx, start, total) item(list, ctx, index, text)
 //   MCU -> Python: vol(clicks) cmd(code) hello()
+//                  get(list, ctx, start) sel(list, ctx, index, action)
+// Menu lists live in Python; the sketch asks for one page (8 rows) at a time.
 // Bridge callbacks run in the Bridge thread, not in loop(): they only copy
 // the data into an inbox, and loop() draws it. Two threads must never
 // talk to the display at the same time.
@@ -181,7 +185,8 @@ struct Track {
 };
 struct Station { const char *name, *sub, *fmt; };
 struct Album { const char *artist, *name; int16_t year; };
-struct Level { uint8_t id; int ctx; int cursor; };
+struct Level { uint8_t id; int ctx; int cursor; int total; char title[40]; };   // total -1 = not known yet
+struct InItem { int8_t kind; int list, ctx, index, total; char text[68]; };     // kind 0 page, 1 item
 struct RainCol { int16_t head; uint8_t len, period, phase; };
 struct NowInfo {
   char artist[48], title[72], album[56], fmt[16], src[8];
@@ -192,69 +197,9 @@ struct NowInfo {
 enum { L_ROOT, L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD };
 enum { V_NOW, V_SPECTRUM, V_VU, V_EYE };
 
-// ---- Placeholder lists ---------------------------------------------------
-// The menu still uses these until the library lists come from MPD.
-const Track QUEUE[] = {
-  {"Daft Punk", "One More Time", "Discovery", 2001, 320, 1, 14},
-  {"Depeche Mode", "Enjoy the Silence", "Violator", 1990, 373, 6, 9},
-  {"Enigma", "Sadeness (Part I)", "MCMXC a.D.", 1990, 257, 2, 8},
-  {"Era", "Ameno", "Era", 1996, 220, 1, 12},
-  {"Imperio", "Atlantis", "Return to Paradise", 1996, 233, 2, 12},
-  {"Jean-Michel Jarre", "Oxygene (Part IV)", "Oxygene", 1976, 248, 4, 6},
-  {"Kraftwerk", "The Model", "The Man-Machine", 1978, 222, 5, 6},
-  {"La Bouche", "Be My Lover", "Sweet Dreams", 1995, 242, 2, 12},
-  {"Massive Attack", "Teardrop", "Mezzanine", 1998, 330, 3, 11},
-  {"Moby", "Porcelain", "Play", 1999, 241, 3, 18},
-  {"Air", "La Femme d'Argent", "Moon Safari", 1998, 428, 1, 10},
-  {"Portishead", "Glory Box", "Dummy", 1994, 306, 11, 11},
-  {"Кино", "Группа крови", "Группа крови", 1988, 286, 1, 11},
-};
-const int QN = sizeof(QUEUE) / sizeof(QUEUE[0]);
-
-const Station STATIONS[] = {
-  {"Radio Paradise", "Main Mix", "FLAC"},
-  {"Radio Paradise", "Mellow Mix", "FLAC"},
-  {"SomaFM", "Groove Salad", "AAC 128"},
-  {"SomaFM", "Drone Zone", "AAC 128"},
-  {"FIP", "Paris", "AAC 192"},
-  {"Radio Swiss Jazz", "Jazz", "MP3 128"},
-  {"BBC Radio 3", "Classical", "AAC 320"},
-};
-const int SN = sizeof(STATIONS) / sizeof(STATIONS[0]);
-
-const char *const ARTISTS[] = {
-  "ABBA", "Air", "Alphaville", "Aphex Twin", "Bjork", "Daft Punk",
-  "Deep Forest", "Depeche Mode", "Enigma", "Era", "Faithless", "Imperio",
-  "Jean-Michel Jarre", "Kraftwerk", "La Bouche", "Massive Attack", "Moby",
-  "Pet Shop Boys", "Portishead", "Royksopp", "Sade", "Tangerine Dream",
-  "Vangelis", "Yello", "Аквариум", "Земфира", "Кино", "Мумий Тролль",
-  "Сплин",
-};
-const int AN = sizeof(ARTISTS) / sizeof(ARTISTS[0]);
-
-const Album ALBUMS[] = {
-  {"Air", "Moon Safari", 1998},
-  {"Daft Punk", "Discovery", 2001},
-  {"Daft Punk", "Homework", 1997},
-  {"Depeche Mode", "Music for the Masses", 1987},
-  {"Depeche Mode", "Violator", 1990},
-  {"Enigma", "MCMXC a.D.", 1990},
-  {"Enigma", "The Cross of Changes", 1993},
-  {"Era", "Era", 1996},
-  {"Imperio", "Return to Paradise", 1996},
-  {"Jean-Michel Jarre", "Equinoxe", 1978},
-  {"Jean-Michel Jarre", "Oxygene", 1976},
-  {"Kraftwerk", "Computer World", 1981},
-  {"Kraftwerk", "The Man-Machine", 1978},
-  {"La Bouche", "Sweet Dreams", 1995},
-  {"Massive Attack", "Mezzanine", 1998},
-  {"Moby", "Play", 1999},
-  {"Portishead", "Dummy", 1994},
-  {"Vangelis", "Blade Runner", 1994},
-  {"Кино", "Группа крови", 1988},
-};
-const int ALN = sizeof(ALBUMS) / sizeof(ALBUMS[0]);
-
+// ---- Menu ----------------------------------------------------------------
+// List ids, shared with Python: 1 queue, 2 artists, 3 an artist's albums,
+// 4 albums, 5 radio, 6 CD. The top level (0) is drawn by the sketch itself.
 const char *const ROOT_ITEMS[] = {"Queue", "Artists", "Albums", "Radio", "CD"};
 const uint8_t ROOT_LISTS[] = {L_QUEUE, L_ARTISTS, L_ALBUMS, L_RADIO, L_CD};
 
@@ -297,7 +242,7 @@ const int ROWS = 8, ROW_Y0 = 24, ROW_H = 21, ROW_W = 306;
 
 // ---- State ---------------------------------------------------------------
 NowInfo now;
-int curQ = -1, curS = -1;
+int curSong = -1;                // queue position of the current song, from MPD
 bool playing = false;
 int mpdState = 0;                // 0 stop, 1 play, 2 pause
 bool rptOn = false, rndOn = false;
@@ -313,11 +258,15 @@ unsigned long levelsAt = 0;
 struct InTrack { char src[8], fmt[16], artist[48], title[72], album[56]; int year, no, of, dur, radio; };
 InTrack inTrack;
 volatile bool inTrackNew = false;
-int inSt[5];
+int inSt[6];
 volatile bool inStNew = false;
 uint8_t inLv[18];
 volatile bool inLvNew = false;
 volatile int inClk = -1;
+InItem inQ[16];                  // menu page/item messages, a small ring buffer
+volatile uint8_t inQHead = 0, inQTail = 0;
+char pageText[8][68];            // the 8 rows on screen
+bool pageHave[8];
 Arduino_LED_Matrix matrix;
 int view = V_NOW;
 bool inMenu = false;
@@ -329,7 +278,6 @@ int volSegsShown = -1;
 int progPx = -1;
 int clockShown = -1;
 unsigned long lastFrame = 0;
-Track genTrack;
 bool onBlack = false;            // drawing on a cleared area: text boxes only as wide as the text
 
 // Animation state
@@ -1150,10 +1098,11 @@ void onTrk(String src, String fmt, String artist, String title, String album,
   interrupts();
 }
 
-// state 0 stop / 1 play / 2 pause, elapsed seconds, volume 0..100 (-1 = none)
-void onSt(int state, int el, int vol, int rpt, int rnd) {
+// state 0 stop / 1 play / 2 pause, elapsed seconds, volume 0..100 (-1 = none),
+// repeat, random, queue position of the current song (-1 = none)
+void onSt(int state, int el, int vol, int rpt, int rnd, int song) {
   noInterrupts();
-  inSt[0] = state; inSt[1] = el; inSt[2] = vol; inSt[3] = rpt; inSt[4] = rnd;
+  inSt[0] = state; inSt[1] = el; inSt[2] = vol; inSt[3] = rpt; inSt[4] = rnd; inSt[5] = song;
   inStNew = true;
   interrupts();
 }
@@ -1167,6 +1116,21 @@ void onLv(std::vector<uint8_t> v) {
 }
 
 void onClk(int minutes) { inClk = minutes; }
+
+void pushItem(int8_t kind, int list, int ctx, int index, int total, const char *text) {
+  noInterrupts();
+  uint8_t next = (inQHead + 1) % 16;
+  if (next != inQTail) {                       // full: drop (the page is re-requested on demand)
+    InItem &it = inQ[inQHead];
+    it.kind = kind; it.list = list; it.ctx = ctx; it.index = index; it.total = total;
+    snprintf(it.text, sizeof(it.text), "%s", text);
+    inQHead = next;
+  }
+  interrupts();
+}
+
+void onPage(int list, int ctx, int start, int total) { pushItem(0, list, ctx, start, total, ""); }
+void onItem(int list, int ctx, int index, String text) { pushItem(1, list, ctx, index, 0, text.c_str()); }
 
 // The LED matrix has its own driver, it can be drawn right here.
 void draw(std::vector<uint8_t> frame) {
@@ -1191,7 +1155,7 @@ void applyTrack() {
 }
 
 void applyStatus() {
-  int s[5];
+  int s[6];
   noInterrupts();
   memcpy(s, inSt, sizeof(s));
   inStNew = false;
@@ -1201,6 +1165,7 @@ void applyStatus() {
   mpdState = s[0];
   playing = mpdState == 1;
   rptOn = s[3]; rndOn = s[4];
+  curSong = s[5];
   elapsed = s[1];
   tickAt = millis();
   if (playing && idle) exitIdle();
@@ -1213,7 +1178,17 @@ void applyStatus() {
   onTimeTick();
 }
 
+void applyMenuItem(const InItem &it);
+
 void applyInbox() {
+  while (inQTail != inQHead) {
+    InItem it;
+    noInterrupts();
+    it = inQ[inQTail];
+    inQTail = (inQTail + 1) % 16;
+    interrupts();
+    applyMenuItem(it);
+  }
   if (inTrackNew) applyTrack();
   if (inStNew) applyStatus();
   if (inLvNew) {
@@ -1237,45 +1212,18 @@ const int CMD_TOGGLE = 1, CMD_NEXT = 2, CMD_PREV = 3;
 void sendCmd(int code) { Bridge.notify("cmd", code); }
 
 // ---- Menu data -----------------------------------------------------------
-int artistAlbumCount(int a) {
-  int n = 0;
-  for (int k = 0; k < ALN; k++) if (!strcmp(ALBUMS[k].artist, ARTISTS[a])) n++;
-  return n;
-}
-
-int artistAlbum(int a, int i) {
-  for (int k = 0; k < ALN; k++)
-    if (!strcmp(ALBUMS[k].artist, ARTISTS[a]) && i-- == 0) return k;
-  return -1;
-}
-
 int listCount(const Level &l) {
-  switch (l.id) {
-    case L_ROOT: return 5;
-    case L_QUEUE: return QN;
-    case L_ARTISTS: return AN;
-    case L_ARTIST_ALBUMS: return imax(1, artistAlbumCount(l.ctx));
-    case L_ALBUMS: return ALN;
-    case L_RADIO: return SN;
-    default: return 1;
-  }
+  if (l.id == L_ROOT) return 5;
+  if (l.id == L_CD) return 1;
+  return l.total;                              // -1 until Python answers
 }
 
 void listLabel(const Level &l, int i, char *out, size_t n) {
-  switch (l.id) {
-    case L_ROOT: snprintf(out, n, "%s", ROOT_ITEMS[i]); break;
-    case L_QUEUE: snprintf(out, n, "%c%s - %s", i == curQ ? 16 : ' ', QUEUE[i].artist, QUEUE[i].title); break;
-    case L_ARTISTS: snprintf(out, n, "%s", ARTISTS[i]); break;
-    case L_ARTIST_ALBUMS: {
-      int k = artistAlbum(l.ctx, i);
-      if (k < 0) snprintf(out, n, "Greatest Hits");
-      else snprintf(out, n, "%s", ALBUMS[k].name);
-      break;
-    }
-    case L_ALBUMS: snprintf(out, n, "%s", ALBUMS[i].name); break;
-    case L_RADIO: snprintf(out, n, "%c%s %s", i == curS ? 16 : ' ', STATIONS[i].name, STATIONS[i].sub); break;
-    default: snprintf(out, n, "No disc"); break;
-  }
+  int row = i - i / ROWS * ROWS;
+  if (l.id == L_ROOT) snprintf(out, n, "%s", ROOT_ITEMS[i]);
+  else if (l.id == L_CD) snprintf(out, n, "No disc");
+  else if (l.total == 0) snprintf(out, n, "(empty)");
+  else snprintf(out, n, "%s", pageHave[row] ? pageText[row] : "...");
 }
 
 const char *listTitle(const Level &l) {
@@ -1283,7 +1231,7 @@ const char *listTitle(const Level &l) {
     case L_ROOT: return "MENU";
     case L_QUEUE: return "QUEUE";
     case L_ARTISTS: return "ARTISTS";
-    case L_ARTIST_ALBUMS: return ARTISTS[l.ctx];
+    case L_ARTIST_ALBUMS: return l.title;
     case L_ALBUMS: return "ALBUMS";
     case L_RADIO: return "RADIO";
     default: return "CD";
@@ -1291,6 +1239,7 @@ const char *listTitle(const Level &l) {
 }
 
 bool opensSubmenu(const Level &l) { return l.id == L_ROOT || l.id == L_ARTISTS; }
+bool fromPython(const Level &l) { return l.id != L_ROOT && l.id != L_CD; }
 
 // ---- Menu drawing --------------------------------------------------------
 int pageTop(int c) { return c / ROWS * ROWS; }
@@ -1300,7 +1249,9 @@ void menuHeader() {
   char b[40];
   snprintf(b, sizeof(b), "< %s", listTitle(l));
   textBox(0, 0, 220, HEAD_H, 6, 3, b, 2, VFD, BLACK);
-  snprintf(b, sizeof(b), "%d/%d", l.cursor + 1, listCount(l));
+  int n = listCount(l);
+  if (n > 0) snprintf(b, sizeof(b), "%d/%d", l.cursor + 1, n);
+  else b[0] = 0;
   textR(220, 0, 100, HEAD_H, 3, 6, b, 2, MUTED, BLACK);
 }
 
@@ -1308,7 +1259,9 @@ void menuRow(int i) {
   Level &l = st[depth];
   int idx = pageTop(l.cursor) + i;
   int y = ROW_Y0 + i * ROW_H;
-  if (idx >= listCount(l)) {
+  int n = listCount(l);
+  if (n <= 0) n = 1;                           // loading ("...") or empty ("(empty)"): one row
+  if (idx >= n) {
     if (rowW[i] > 0) tft.fillRect(0, y, rowW[i], ROW_H, BLACK);
     rowW[i] = 0;
     return;
@@ -1330,7 +1283,7 @@ void menuRow(int i) {
 
 void menuScrollbar() {
   Level &l = st[depth];
-  int n = listCount(l), x = 310, y = ROW_Y0, h = ROWS * ROW_H - 1;
+  int n = imax(0, listCount(l)), x = 310, y = ROW_Y0, h = ROWS * ROW_H - 1;
   tft.fillRect(ROW_W, y, 320 - ROW_W, h, BLACK);
   if (n <= ROWS) return;
   int pages = (n + ROWS - 1) / ROWS;
@@ -1354,11 +1307,40 @@ void menuRows() {
   menuScrollbar();
 }
 
+// Ask Python for the page under the cursor; its rows show "..." until then.
+void requestPage() {
+  Level &l = st[depth];
+  for (int i = 0; i < ROWS; i++) pageHave[i] = false;
+  if (fromPython(l)) Bridge.notify("get", (int)l.id, l.ctx, pageTop(l.cursor));
+}
+
+void applyMenuItem(const InItem &it) {
+  if (!inMenu || idle) return;
+  Level &l = st[depth];
+  if (it.list != l.id || it.ctx != l.ctx) return;           // an old answer
+  if (it.kind == 0) {
+    if (it.index != pageTop(l.cursor)) return;
+    l.total = it.total;
+    if (l.total > 0 && l.cursor >= l.total) {               // the list got shorter
+      l.cursor = l.total - 1;
+      requestPage();
+    }
+    menuHeader();
+    menuRows();
+  } else {
+    int row = it.index - pageTop(l.cursor);
+    if (row < 0 || row >= ROWS) return;
+    snprintf(pageText[row], sizeof(pageText[row]), "%s", it.text);
+    pageHave[row] = true;
+    menuRow(row);
+  }
+}
+
 void menuEnter() {
   unsigned long t0 = millis();
   inMenu = true;
   depth = 0;
-  st[0] = {L_ROOT, 0, 0};
+  st[0] = {L_ROOT, 0, 0, 5, ""};
   eraseView(view);
   for (int i = 0; i < ROWS; i++) rowW[i] = 0;       // rows area is black now
   tft.fillRect(276, 204, 44, 24, BLACK);           // volume number
@@ -1371,7 +1353,9 @@ void menuEnter() {
 void menuOpen(uint8_t id, int ctx, int cursor) {
   unsigned long t0 = millis();
   depth++;
-  st[depth] = {id, ctx, cursor};
+  st[depth] = {id, ctx, cursor, -1, ""};
+  if (id == L_CD) st[depth].total = 1;
+  requestPage();
   menuHeader();
   menuRows();
   showMs(millis() - t0);
@@ -1394,6 +1378,7 @@ void menuBack() {
   if (depth == 0) { menuExit(-1); return; }
   unsigned long t0 = millis();
   depth--;
+  requestPage();                               // only one page is kept: fetch it again
   menuHeader();
   menuRows();
   showMs(millis() - t0);
@@ -1402,12 +1387,14 @@ void menuBack() {
 void menuMove(int d) {
   Level &l = st[depth];
   int n = listCount(l);
+  if (n <= 0) return;                          // still loading
   int c = imax(0, imin(n - 1, l.cursor + d));
   if (c == l.cursor) return;
   int old = l.cursor;
   l.cursor = c;
   if (pageTop(c) != pageTop(old)) {
     unsigned long t0 = millis();
+    requestPage();
     menuRows();
     showMs(millis() - t0);
   } else {
@@ -1425,17 +1412,33 @@ void menuSelect() {
   switch (l.id) {
     case L_ROOT: {
       uint8_t id = ROOT_LISTS[i];
-      int c = id == L_QUEUE && curQ >= 0 ? curQ : id == L_RADIO && curS >= 0 ? curS : 0;
-      menuOpen(id, 0, c);
+      menuOpen(id, 0, id == L_QUEUE && curSong >= 0 ? curSong : 0);
       break;
     }
-    case L_ARTISTS: menuOpen(L_ARTIST_ALBUMS, i, 0); break;
-    default: toast("Not wired yet"); break;     // lists come from MPD in the next step
+    case L_CD: toast("No disc"); break;
+    case L_ARTISTS: {
+      int row = i - pageTop(i);
+      if (!pageHave[row]) break;               // not loaded yet
+      char name[40];
+      snprintf(name, sizeof(name), "%s", pageText[row]);
+      menuOpen(L_ARTIST_ALBUMS, i, 0);
+      snprintf(st[depth].title, sizeof(st[depth].title), "%s", name);
+      menuHeader();
+      break;
+    }
+    default:                                   // queue, albums, radio: play it
+      if (listCount(l) <= 0) break;
+      Bridge.notify("sel", (int)l.id, l.ctx, i, 0);
+      menuExit(V_NOW);
+      break;
   }
 }
 
 void menuLong() {
-  if (st[depth].id != L_ROOT) toast("Not wired yet");
+  Level &l = st[depth];
+  if (l.id == L_ROOT || l.id == L_QUEUE || l.id == L_CD || listCount(l) <= 0) return;
+  Bridge.notify("sel", (int)l.id, l.ctx, l.cursor, 1);
+  toast("Added to queue");
 }
 
 // ---- Input handling --------------------------------------------------------
@@ -1546,6 +1549,8 @@ void setup() {
   Bridge.provide("st", onSt);
   Bridge.provide("lv", onLv);
   Bridge.provide("clk", onClk);
+  Bridge.provide("page", onPage);
+  Bridge.provide("item", onItem);
   Bridge.notify("hello");       // Python answers with the full state
   pausedSince = millis();
 }

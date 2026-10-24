@@ -229,5 +229,7 @@ controller = Controller(send)
 Bridge.provide("vol", controller.on_vol)
 Bridge.provide("cmd", controller.on_cmd)
 Bridge.provide("hello", controller.on_hello)
+Bridge.provide("get", controller.on_get)
+Bridge.provide("sel", controller.on_sel)
 
 App.run(user_loop=loop)
