@@ -859,7 +859,7 @@ void marqueeSetup() {
     eyeTitle(l1, l2, sizeof(l1));
     if (l2[0]) return;                         // fits on two lines
     x = EYE_TX; y = 47; w = EYE_TW; h = 16; padY = 0; size = 2;
-  } else if (view == V_VU) { x = 8; y = 153; w = 304; h = 16; padY = 0; size = 2; }
+  } else if (view == V_VU) { x = 8; y = 153; w = 312; h = 16; padY = 0; size = 2; }   // the static title runs to the screen edge
   else return;
   int textW = u8len(now.title) * 6 * size - size;   // the last glyph column is blank
   if (textW <= w) return;
