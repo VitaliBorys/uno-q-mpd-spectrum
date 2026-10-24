@@ -1,6 +1,6 @@
 # MPD Spectrum Analyzer and Remote for Arduino UNO Q
 
-![UNO Q spectrum analyzer with ZK-QCC DAC and TPA3116 amplifier](docs/setup.jpg)
+![UNO Q with the TFT remote (VU meters), LED matrix spectrum, ZK-QCC DAC and TPA3116 amplifier](docs/setup.jpg)
 
 A spectrum analyzer and a physical remote for [MPD](https://www.musicpd.org)
 on the [Arduino UNO Q](https://www.arduino.cc/product-uno-q), driven by
