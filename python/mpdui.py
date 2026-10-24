@@ -50,6 +50,7 @@ CURRENT = "\x10"             # glyph 16 in the sketch's font: a small play trian
 # Field limits in bytes. One Bridge message must fit in 256 bytes.
 LIMITS = {"src": 7, "fmt": 15, "artist": 44, "title": 64, "album": 52}
 
+STREAM_CODECS = {"MP3", "OGG", "OGA", "OPUS", "AAC", "M4A"}
 LOSSLESS = {"FLAC", "WAV", "AIFF", "AIF", "APE", "WV", "ALAC", "DSF", "DFF", "CD"}
 
 
@@ -232,7 +233,10 @@ def describe_format(song, status, codec=None):
     if codec is not None:
         pass
     elif path.startswith(("http://", "https://")):
-        codec = "FLAC" if "flac" in path.lower() else ""
+        # Streams: a hint in the URL (".../flacm", "stream.ogg", "x.mp3"), if any
+        url = path.lower().split("?", 1)[0]
+        ext = extension(url)
+        codec = ("FLAC" if "flac" in url else ext if ext in STREAM_CODECS else "")
     elif path.startswith("cdda://"):
         codec = "CD"
     else:
@@ -251,8 +255,8 @@ def describe_format(song, status, codec=None):
         khz = rate // 1000
         return f"{codec} {bits}/{khz}" if bits.isdigit() else f"{codec} {khz}k"
     bitrate = status.get("bitrate", "0")
-    if codec and bitrate not in ("", "0"):
-        return f"{codec} {bitrate}"
+    if bitrate not in ("", "0"):
+        return f"{codec} {bitrate}" if codec else f"{bitrate} kbps"
     if bits.isdigit() and rate:                  # codec unknown: at least 16/44
         return f"{bits}/{rate // 1000}"
     return codec
