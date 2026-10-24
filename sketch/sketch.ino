@@ -188,6 +188,7 @@ struct Album { const char *artist, *name; int16_t year; };
 struct Level { uint8_t id; int ctx; int cursor; int total; char title[40]; };   // total -1 = not known yet
 struct InItem { int8_t kind; int list, ctx, index, total; char text[68]; };     // kind 0 page, 1 item
 struct RainCol { int16_t head; uint8_t len, period, phase; };
+struct Marquee { bool on; int x, y, w, h, padY; uint8_t size; int maxOff, off; uint8_t phase; unsigned long at; };
 struct NowInfo {
   char artist[48], title[72], album[56], fmt[16], src[8];
   int year, no, of, dur;
@@ -249,6 +250,7 @@ bool rptOn = false, rndOn = false;
 int elapsed = 0;
 unsigned long tickAt = 0;
 int volume = 0;
+bool volKnown = false;           // false: MPD has no mixer (sound card unplugged) -> "VOL --"
 unsigned long volLocalAt = 0;    // last volume change made with the knob
 int clockBase = -1;              // minutes since midnight from Python, -1 = unknown
 unsigned long clockAt = 0;
@@ -428,16 +430,19 @@ void wrap2(const char *s, int n, char *l1, char *l2, size_t cap) {
 // ---- Text ----------------------------------------------------------------
 // Draws a w x h box filled with bg, with the text at (padX, padY) inside it.
 // The text is clipped to whole characters that fit. One SPI burst per strip.
-void textBox(int x, int y, int w, int h, int padX, int padY,
-             const char *s, uint8_t size, uint16_t fg, uint16_t bg) {
+// With `scroll` > 0 the text is shifted left by that many pixels and cut
+// at the box edges mid-character (the marquee); otherwise only whole
+// characters that fit are drawn.
+void textBoxAt(int x, int y, int w, int h, int padX, int padY,
+               const char *s, uint8_t size, uint16_t fg, uint16_t bg, int scroll) {
   if (w <= 0 || h <= 0) return;
   if (x + w > 320) w = 320 - x;
   if (y + h > 240) h = 240 - y;
   int cw = 6 * size;
-  const uint8_t *gl[64];
-  int len = decodeGlyphs(s, gl, 64);
+  const uint8_t *gl[72];
+  int len = decodeGlyphs(s, gl, 72);
   int fit = padX < w ? (w - padX) / cw : 0;
-  if (len > fit) len = fit;
+  if (scroll <= 0 && len > fit) len = fit;
   int stripRows = (int)(sizeof(pbuf) / sizeof(pbuf[0])) / w;
 
   tft.startWrite();
@@ -452,7 +457,7 @@ void textBox(int x, int y, int w, int h, int padX, int padY,
       for (int c = 0; c < w; c++) {
         bool on = false;
         if (inY) {
-          int gx = c - padX;
+          int gx = c - padX + scroll;
           if (gx >= 0) {
             gx /= size;
             int ch = gx / 6, col = gx % 6;
@@ -466,6 +471,11 @@ void textBox(int x, int y, int w, int h, int padX, int padY,
     tft.sendPixels(pbuf, (size_t)n * w);
   }
   tft.endWrite();
+}
+
+void textBox(int x, int y, int w, int h, int padX, int padY,
+             const char *s, uint8_t size, uint16_t fg, uint16_t bg) {
+  textBoxAt(x, y, w, h, padX, padY, s, size, fg, bg, 0);
 }
 
 // Text exactly as wide as the box, starting at x.
@@ -532,15 +542,16 @@ void drawHeader() {
 }
 
 void drawVolume() {
-  int lit = (volume * VOL_SEGS + 50) / 100;
+  int lit = volKnown ? (volume * VOL_SEGS + 50) / 100 : 0;
   int from = 0, to = VOL_SEGS;
   if (volSegsShown >= 0) { from = imin(lit, volSegsShown); to = imax(lit, volSegsShown); }
   for (int i = from; i < to; i++)
     tft.fillRect(VOL_X + i * VOL_SW, VOL_Y, VOL_SW - 3, 12, i < lit ? VFD : DIM);
   volSegsShown = lit;
   char b[8];
-  snprintf(b, sizeof(b), "%3d", volume);
-  textBox(278, 210, 42, 16, 2, 0, b, 2, VFD, BLACK);
+  if (volKnown) snprintf(b, sizeof(b), "%3d", volume);
+  else snprintf(b, sizeof(b), " --");
+  textBox(278, 210, 42, 16, 2, 0, b, 2, volKnown ? VFD : MUTED, BLACK);
 }
 
 void drawFooter() {
@@ -762,11 +773,18 @@ int eyeTargetK() {
   return imax(3, imin(23, (int)lroundf(half / 2)));
 }
 
+// The title on the eye screen: one or two lines of 12; longer titles stay on
+// one line and scroll (l1 = the whole title, l2 empty).
+void eyeTitle(char *l1, char *l2, size_t cap) {
+  wrap2(now.title, EYE_TW / 12, l1, l2, cap);
+  if (u8len(l2) > EYE_TW / 12) { snprintf(l1, cap, "%s", now.title); l2[0] = 0; }
+}
+
 void eyeText() {
-  char b[64], l1[48], l2[48];
+  char b[64], l1[80], l2[80];
   upper(now.artist, b, sizeof(b));
   textBox(EYE_TX, 32, fitW(EYE_TW, 0, b, 1), 10, 0, 1, b, 1, MUTED, BLACK);
-  wrap2(now.title, EYE_TW / 12, l1, l2, sizeof(l1));
+  eyeTitle(l1, l2, sizeof(l1));
   textBox(EYE_TX, 46, fitW(EYE_TW, 0, l1, 2), 18, 0, 1, l1, 2, VFD, BLACK);
   textBox(EYE_TX, 64, fitW(EYE_TW, 0, l2, 2), 18, 0, 1, l2, 2, VFD, BLACK);
   wrap2(now.album, EYE_TW / 6, l1, l2, sizeof(l1));
@@ -818,9 +836,46 @@ void takeLevels() {
   }
 }
 
+// ---- Marquee: a long title swings left to its end and back ---------------
+// Stands 2 s at each end, moves 3 px every 60 ms (~50 px/s). One step
+// redraws just the title box.
+const unsigned long MQ_HOLD_MS = 2000, MQ_STEP_MS = 60;
+const int MQ_PX = 3;
+Marquee mq;
+
+void marqueeSetup() {
+  mq.on = false;
+  if (inMenu || idle) return;
+  int x, y, w, h, padY, size;
+  if (view == V_NOW) { x = 8; y = 46; w = 304; h = 28; padY = 2; size = 3; }
+  else if (view == V_EYE) {
+    char l1[80], l2[80];
+    eyeTitle(l1, l2, sizeof(l1));
+    if (l2[0]) return;                         // fits on two lines
+    x = EYE_TX; y = 46; w = EYE_TW; h = 18; padY = 1; size = 2;
+  } else return;
+  int textW = u8len(now.title) * 6 * size - size;   // the last glyph column is blank
+  if (textW <= w) return;
+  mq = {true, x, y, w, h, padY, (uint8_t)size, textW - w, 0, 0, millis()};
+}
+
+void marqueeStep() {
+  if (!mq.on) return;
+  unsigned long t = millis();
+  if (mq.phase == 0 || mq.phase == 2) {        // standing at an end
+    if (t - mq.at >= MQ_HOLD_MS) { mq.phase++; mq.at = t; }
+    return;
+  }
+  if (t - mq.at < MQ_STEP_MS) return;
+  mq.at = t;
+  if (mq.phase == 1) { mq.off = imin(mq.maxOff, mq.off + MQ_PX); if (mq.off == mq.maxOff) mq.phase = 2; }
+  else               { mq.off = imax(0, mq.off - MQ_PX);         if (mq.off == 0) mq.phase = 0; }
+  textBoxAt(mq.x, mq.y, mq.w, mq.h, 0, mq.padY, now.title, mq.size, VFD, BLACK, mq.off);
+}
+
 // ---- Erasing a view: only what it drew, not the whole area ----------------
 void eraseView(int v) {
-  char b[64], l1[48], l2[48];
+  char b[64], l1[80], l2[80];
   switch (v) {
     case V_NOW:
       upper(now.artist, b, sizeof(b));
@@ -850,7 +905,7 @@ void eraseView(int v) {
       tft.fillCircle(EYE_CX, EYE_CY, EYE_R + 4, BLACK);
       upper(now.artist, b, sizeof(b));
       eraseText(EYE_TX, 32, 10, 0, b, 1, EYE_TW);
-      wrap2(now.title, EYE_TW / 12, l1, l2, sizeof(l1));
+      eyeTitle(l1, l2, sizeof(l1));
       eraseText(EYE_TX, 46, 18, 0, l1, 2, EYE_TW);
       eraseText(EYE_TX, 64, 18, 0, l2, 2, EYE_TW);
       wrap2(now.album, EYE_TW / 6, l1, l2, sizeof(l1));
@@ -981,6 +1036,7 @@ void rainFrame() {
 
 void enterIdle() {
   idle = true;
+  mq.on = false;
   inMenu = false;
   memset(mxLevel, 0, sizeof(mxLevel));
   memset(mxLock, 0, sizeof(mxLock));
@@ -1007,6 +1063,7 @@ void drawViewFull() {
   drawViewContent();
   onBlack = false;
   drawFooter();
+  marqueeSetup();
 }
 
 void switchView(int d) {
@@ -1016,6 +1073,7 @@ void switchView(int d) {
   onBlack = true;
   drawViewContent();
   onBlack = false;
+  marqueeSetup();
   showMs(millis() - t0);
 }
 
@@ -1025,7 +1083,7 @@ void switchView(int d) {
 void eraseTrackText() {
   if (view == V_NOW || view == V_EYE || view == V_VU) {
     // Same as erasing the view, but keep graphics (eye, meters) in place.
-    char b[64], l1[48], l2[48];
+    char b[64], l1[80], l2[80];
     if (view == V_NOW) {
       upper(now.artist, b, sizeof(b));
       eraseText(0, 26, 18, 8, b, 2, 320);
@@ -1036,7 +1094,7 @@ void eraseTrackText() {
     } else if (view == V_EYE) {
       upper(now.artist, b, sizeof(b));
       eraseText(EYE_TX, 32, 10, 0, b, 1, EYE_TW);
-      wrap2(now.title, EYE_TW / 12, l1, l2, sizeof(l1));
+      eyeTitle(l1, l2, sizeof(l1));
       eraseText(EYE_TX, 46, 18, 0, l1, 2, EYE_TW);
       eraseText(EYE_TX, 64, 18, 0, l2, 2, EYE_TW);
       wrap2(now.album, EYE_TW / 6, l1, l2, sizeof(l1));
@@ -1060,6 +1118,7 @@ void onTrackChanged() {
   else if (view == V_EYE) { eyeText(); progPx = -1; eyeTime(true); }
   else if (view == V_VU) vuText();
   onBlack = false;
+  marqueeSetup();
 }
 
 void onStateChanged() {
@@ -1170,7 +1229,10 @@ void applyStatus() {
   tickAt = millis();
   if (playing && idle) exitIdle();
   // The knob wins for a moment: replies to our own changes arrive late.
-  if (s[2] >= 0 && s[2] != volume && millis() - volLocalAt > 800) {
+  if (s[2] < 0) {                              // no mixer
+    if (volKnown) { volKnown = false; if (!inMenu && !idle) drawVolume(); }
+  } else if (!volKnown || (s[2] != volume && millis() - volLocalAt > 800)) {
+    volKnown = true;
     volume = s[2];
     if (!inMenu && !idle) drawVolume();
   }
@@ -1339,6 +1401,7 @@ void applyMenuItem(const InItem &it) {
 void menuEnter() {
   unsigned long t0 = millis();
   inMenu = true;
+  mq.on = false;
   depth = 0;
   st[0] = {L_ROOT, 0, 0, 5, ""};
   eraseView(view);
@@ -1482,7 +1545,7 @@ void handleInput() {
   if (dp) { if (inMenu) menuMove(dp * ROWS); else switchView(dp); }
   if (dn) {
     if (inMenu) menuMove(dn);
-    else {
+    else if (volKnown) {
       // Shown at once; MPD's own value comes back in the next status.
       volume = imax(0, imin(100, volume + dn * VOLUME_STEP));
       volLocalAt = millis();
@@ -1575,6 +1638,7 @@ void loop() {
   if (!playing && t - pausedSince >= IDLE_MS && t - lastInputAt >= IDLE_MS) { enterIdle(); return; }
 
   if (!inMenu && clockNow() != clockShown) headerClock();
+  if (!inMenu) marqueeStep();
 
   if (inMenu && toastUntil && t > toastUntil) { toastUntil = 0; menuHint(); }
 
