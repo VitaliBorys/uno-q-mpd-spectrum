@@ -41,6 +41,13 @@ for f in drivers/scsi/sr.c drivers/scsi/sr.h drivers/scsi/sr_ioctl.c \
     curl -fsSL "$BASE/$f?h=$TAG" -o "$(basename "$f")"
 done
 
+# This kernel is built without CONFIG_CDROM, so struct gendisk has no "cdi"
+# field. Only cdrom.c itself writes it; the built-in kernel code reads it
+# through disk_to_cdi(), which is NULL without CONFIG_CDROM anyway. Drop the
+# write (adding the field would change the struct and break the kernel).
+sed -i 's|^\(\s*\)disk->cdi = cdi;|\1/* struct gendisk has no cdi field here (CONFIG_CDROM=n) */|' cdrom.c
+grep -q 'disk->cdi' cdrom.c && { echo "cdrom.c still uses disk->cdi: patch did not apply"; exit 1; }
+
 # 4. Build, install, load
 make
 sudo install -D -m 644 cdrom.ko  "/lib/modules/$KVER/updates/cdrom.ko"
