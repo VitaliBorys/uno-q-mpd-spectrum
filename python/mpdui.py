@@ -290,7 +290,9 @@ def describe_track(song, status, radio, codec=None):
         dur = int(float(song.get("duration") or song.get("Time") or 0))
     except ValueError:
         dur = 0
-    src = "CD" if path.startswith("cdda://") else "NAS"
+    # music_directory holds nas/ (the QNAP over NFS) and rips/ (the USB stick)
+    src = ("CD" if path.startswith("cdda://") else
+           "USB" if path.startswith("rips/") else "NAS")
     return (src, fmt, artist, title, album, year, no, of, dur, 0)
 
 
