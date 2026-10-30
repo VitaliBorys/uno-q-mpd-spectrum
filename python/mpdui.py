@@ -45,6 +45,10 @@ DEV_POLL_S = 2               # how often to look for the CD drive and the USB st
 DEV_CD, DEV_USB = 1, 2
 USB_PART = "rips"            # GPT partition name of the stick with the rips
 USB_DIR = "rips"             # its folder in MPD's music_directory
+# A stick pulled while mounted stays mounted (dead) until the automount idle
+# timeout (60 s in fstab); MPD's update right away sees I/O errors. So the
+# folder is rescanned again after that.
+USB_RESCAN_S = 90
 
 # Button codes sent by the sketch (must match sketch.ino)
 CMD_TOGGLE, CMD_NEXT, CMD_PREV = 1, 2, 3
@@ -237,12 +241,13 @@ def devices(sys_block="/sys/class/block"):
     /sys: sr0 is the CD drive, and the stick is the partition named "rips".
     Reading these few small files costs microseconds and never touches
     the devices themselves."""
-    mask = DEV_CD if os.path.exists(os.path.join(sys_block, "sr0")) else 0
     try:
-        names = [n for n in os.listdir(sys_block) if n.startswith("sd")]
+        names = os.listdir(sys_block)
     except OSError:
         names = []
-    for name in names:
+    # sr0, or sr1 after a USB reset re-attaches the drive
+    mask = DEV_CD if any(n.startswith("sr") for n in names) else 0
+    for name in (n for n in names if n.startswith("sd")):
         try:
             with open(os.path.join(sys_block, name, "uevent")) as f:
                 if f"PARTNAME={USB_PART}" in f.read().splitlines():
@@ -377,6 +382,7 @@ class Controller:
         self.cue_codecs = {}         # CUE sheet path -> codec of its audio file
         self.cd_count = 0            # audio tracks on the disc (see _cd_tracks)
         self.dev = None              # last dev(mask) sent
+        self.rescan_at = 0           # when to rescan the stick's folder again
         self.cd_checked = -CD_CACHE_S
         self.mpd = Mpd()             # commands and status (shared, under lock)
         self.lock = threading.Lock()
@@ -448,7 +454,11 @@ class Controller:
             self.send("dev", mask)
             if self.dev is not None and (mask ^ self.dev) & DEV_USB:
                 self.events.put(("update", USB_DIR))
+                self.rescan_at = time.monotonic() + USB_RESCAN_S
             self.dev = mask
+        if self.rescan_at and time.monotonic() >= self.rescan_at:
+            self.rescan_at = 0
+            self.events.put(("update", USB_DIR))
 
     def push_clock(self, force=False):
         minute = local_minutes()
