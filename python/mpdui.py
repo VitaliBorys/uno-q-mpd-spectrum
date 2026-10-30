@@ -380,8 +380,14 @@ class Controller:
         if cue not in self.cue_codecs:
             folder, _, sheet = cue.rpartition("/")
             stem = sheet[:-4].casefold()
+            skip = ("", "CUE", "LOG", "TXT", "JPG", "PNG", "M3U", "M3U8", "TOC", "NFO")
             files = [v for k, v in self.mpd.lines(f"lsinfo {quote(folder)}") if k == "file"]
-            audio = [f for f in files if extension(f) not in ("", "CUE", "LOG", "TXT", "JPG", "PNG")]
+            audio = [f for f in files if extension(f) not in skip]
+            if not audio:
+                # MPD 0.24 hides the files a CUE sheet refers to (e.g. whipper's
+                # per-track FLACs next to its .cue); listfiles still shows them.
+                files = [v for k, v in self.mpd.lines(f"listfiles {quote(folder)}") if k == "file"]
+                audio = [f for f in files if extension(f) not in skip]
             same = [f for f in audio if f.rsplit("/", 1)[-1].casefold().startswith(stem + ".")]
             self.cue_codecs[cue] = extension((same or audio or [""])[0])
         return self.cue_codecs[cue]
