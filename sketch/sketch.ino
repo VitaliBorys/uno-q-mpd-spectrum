@@ -1308,15 +1308,14 @@ void sendCmd(int code) { Bridge.notify("cmd", code); }
 // ---- Menu data -----------------------------------------------------------
 int listCount(const Level &l) {
   if (l.id == L_ROOT) return 5;
-  if (l.id == L_CD) return 1;
   return l.total;                              // -1 until Python answers
 }
 
 void listLabel(const Level &l, int i, char *out, size_t n) {
   int row = i - i / ROWS * ROWS;
   if (l.id == L_ROOT) snprintf(out, n, "%s", ROOT_ITEMS[i]);
-  else if (l.id == L_CD) snprintf(out, n, "No disc");
-  else if (l.total == 0) snprintf(out, n, "(empty)");
+  else if (l.total == 0) snprintf(out, n, l.id == L_CD ? "No disc" : "(empty)");
+  else if (l.total < 0 && l.id == L_CD) snprintf(out, n, "Reading disc...");
   else snprintf(out, n, "%s", pageHave[row] ? pageText[row] : "...");
 }
 
@@ -1333,7 +1332,7 @@ const char *listTitle(const Level &l) {
 }
 
 bool opensSubmenu(const Level &l) { return l.id == L_ROOT || l.id == L_ARTISTS; }
-bool fromPython(const Level &l) { return l.id != L_ROOT && l.id != L_CD; }
+bool fromPython(const Level &l) { return l.id != L_ROOT; }
 
 // ---- Menu drawing --------------------------------------------------------
 int pageTop(int c) { return c / ROWS * ROWS; }
@@ -1449,7 +1448,6 @@ void menuOpen(uint8_t id, int ctx, int cursor) {
   unsigned long t0 = millis();
   depth++;
   st[depth] = {id, ctx, cursor, -1, ""};
-  if (id == L_CD) st[depth].total = 1;
   requestPage();
   menuHeader();
   menuRows();
@@ -1510,7 +1508,6 @@ void menuSelect() {
       menuOpen(id, 0, id == L_QUEUE && curSong >= 0 ? curSong : 0);
       break;
     }
-    case L_CD: toast("No disc"); break;
     case L_ARTISTS: {
       int row = i - pageTop(i);
       if (!pageHave[row]) break;               // not loaded yet
@@ -1531,7 +1528,7 @@ void menuSelect() {
 
 void menuLong() {
   Level &l = st[depth];
-  if (l.id == L_ROOT || l.id == L_QUEUE || l.id == L_CD || listCount(l) <= 0) return;
+  if (l.id == L_ROOT || l.id == L_QUEUE || listCount(l) <= 0) return;
   Bridge.notify("sel", (int)l.id, l.ctx, l.cursor, 1);
   toast("Added to queue");
 }

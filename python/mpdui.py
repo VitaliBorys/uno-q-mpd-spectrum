@@ -37,6 +37,7 @@ TIMEZONE = "Europe/Warsaw"   # the container runs in UTC; the clock shows local 
 VOLUME_STEP = 2              # percent per knob click (must match the sketch)
 RADIO_FILE = "/app/radio.txt"
 REFRESH_S = 5                # re-send the status this often while playing
+CD_CACHE_S = 5               # how long a probe of the disc stays valid
 
 # Button codes sent by the sketch (must match sketch.ino)
 CMD_TOGGLE, CMD_NEXT, CMD_PREV = 1, 2, 3
@@ -221,6 +222,16 @@ def fit(text, limit):
     return text.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
 
 
+def cd_uri(n):
+    """MPD's URI of audio CD track n (1-based)."""
+    return f"cdda:///{n}"
+
+
+def cd_track(path):
+    """Track number of a cdda:/// URI, 0 for anything else."""
+    return number(path[8:]) if path.startswith("cdda:///") else 0
+
+
 def extension(path):
     name = path.rsplit("/", 1)[-1]
     return name.rsplit(".", 1)[-1].upper() if "." in name else ""
@@ -276,8 +287,10 @@ def describe_track(song, status, radio, codec=None):
         return ("RADIO", fmt, artist, title, station, 0, 0, 0, 0, 1)
 
     artist = song.get("Artist") or song.get("AlbumArtist") or ""
-    title = song.get("Title") or os.path.splitext(path.rsplit("/", 1)[-1])[0]
-    album = song.get("Album", "")
+    cd = cd_track(path)
+    title = (song.get("Title") or (f"Track {cd}" if cd else
+                                   os.path.splitext(path.rsplit("/", 1)[-1])[0]))
+    album = song.get("Album") or ("Audio CD" if cd else "")
     m = re.match(r"\d{4}", song.get("Date", ""))
     year = int(m.group()) if m else 0
     no, of = 0, 0
@@ -286,6 +299,7 @@ def describe_track(song, status, radio, codec=None):
         a, _, b = track.partition("/")
         no = int(a) if a.isdigit() else 0
         of = int(b) if b.isdigit() else 0
+    no = no or cd
     try:
         dur = int(float(song.get("duration") or song.get("Time") or 0))
     except ValueError:
@@ -330,6 +344,8 @@ class Controller:
         self.radio = load_radio()
         self.library = Library()
         self.cue_codecs = {}         # CUE sheet path -> codec of its audio file
+        self.cd_count = 0            # audio tracks on the disc (see _cd_tracks)
+        self.cd_checked = -CD_CACHE_S
         self.mpd = Mpd()             # commands and status (shared, under lock)
         self.lock = threading.Lock()
         self.events = queue.Queue()
@@ -489,8 +505,10 @@ class Controller:
                     text = self.radio.get(path) or song.get("Name") or path
                 else:
                     artist, title = song.get("Artist", ""), song.get("Title", "")
+                    cd = cd_track(path)
                     text = (f"{artist} - {title}" if artist and title
-                            else title or os.path.splitext(path.rsplit("/", 1)[-1])[0])
+                            else title or (f"CD track {cd}" if cd else
+                                           os.path.splitext(path.rsplit("/", 1)[-1])[0]))
                 rows.append((CURRENT if str(i) == current else " ") + text)
             return rows
         if lst == L_ARTISTS:
@@ -504,7 +522,52 @@ class Controller:
             with self.lock:
                 playing = self.mpd.command("currentsong").get("file", "")
             return [(CURRENT if url == playing else " ") + name for url, name in self.radio.items()]
+        if lst == L_CD:
+            count = self._cd_tracks()
+            if not count:
+                return []                    # the sketch shows "No disc"
+            with self.lock:
+                playing = self.mpd.command("currentsong").get("file", "")
+            return [" Play disc"] + [(CURRENT if playing == cd_uri(n) else " ") + f"Track {n}"
+                                     for n in range(1, count + 1)]
         return []
+
+    def _cd_tracks(self):
+        """Audio tracks on the disc, 0 if there is none. MPD can play
+        cdda:///N but can't list a disc, so probe: `lsinfo cdda:///N` fails
+        with "No such file" for a track that exists (no tags) and with
+        "Error ... on track N" past the last one. Kept for a few seconds so
+        paging through the list doesn't probe again."""
+        if time.monotonic() - self.cd_checked < CD_CACHE_S:
+            return self.cd_count
+        with self.lock:
+            def exists(n):
+                try:
+                    self.mpd.lines(f"lsinfo {quote(cd_uri(n))}")
+                    return True
+                except RuntimeError as exc:
+                    if "on track" in str(exc):
+                        return False
+                    if "[50@" in str(exc):
+                        return True
+                    raise                    # no disc, drive not ready
+            try:
+                if not exists(1):
+                    count = 0
+                else:
+                    lo, hi = 1, 2            # lo exists; grow hi until it doesn't
+                    while hi <= 99 and exists(hi):
+                        lo, hi = hi, hi * 2
+                    hi = min(hi, 100)
+                    while hi - lo > 1:       # last existing track in (lo, hi)
+                        mid = (lo + hi) // 2
+                        lo, hi = (mid, hi) if exists(mid) else (lo, mid)
+                    count = lo
+            except RuntimeError as exc:
+                print(f"[mpdui] cd: {exc}")
+                count = 0
+        self.cd_count, self.cd_checked = count, time.monotonic()
+        return count
 
     def _page(self, lst, ctx, start):
         rows = self._rows(lst, ctx)
@@ -528,6 +591,19 @@ class Controller:
         return []
 
     def _select(self, lst, ctx, index, action):
+        if lst == L_CD:
+            count = self._cd_tracks()
+            if not count or index > count:
+                return
+            whole = [f"add {quote(cd_uri(n))}" for n in range(1, count + 1)]
+            with self.lock:
+                if action == 0:              # the whole disc, from this track
+                    self.mpd.batch(["clear"] + whole + [f"play {max(0, index - 1)}"])
+                elif index == 0:
+                    self.mpd.batch(whole)
+                else:
+                    self.mpd.command(f"add {quote(cd_uri(index))}")
+            return
         with self.lock:
             if lst == L_QUEUE:
                 if action == 0:
