@@ -5,6 +5,7 @@ MPD side of the physical controller (TFT + knob + buttons on the MCU).
     trk(src, fmt, artist, title, album, year, no, of, dur, radio)
     st(state, elapsed, volume, repeat, random, song)
     clk(minutes since midnight)
+    dev(mask)     CD drive (1) and USB stick (2) present
 - Turns knob and button events from the MCU into MPD commands:
     vol(clicks)   cmd(code)   hello()
 - Serves the menu one page at a time:
@@ -37,12 +38,23 @@ TIMEZONE = "Europe/Warsaw"   # the container runs in UTC; the clock shows local 
 VOLUME_STEP = 2              # percent per knob click (must match the sketch)
 RADIO_FILE = "/app/radio.txt"
 REFRESH_S = 5                # re-send the status this often while playing
+CD_CACHE_S = 5               # how long a probe of the disc stays valid
+DEV_POLL_S = 2               # how often to look for the CD drive and the USB stick
+
+# Devices, as the dev(mask) bits (must match the sketch)
+DEV_CD, DEV_USB = 1, 2
+USB_PART = "rips"            # GPT partition name of the stick with the rips
+USB_DIR = "rips"             # its folder in MPD's music_directory
+# A stick pulled while mounted stays mounted (dead) until the automount idle
+# timeout (60 s in fstab); MPD's update right away sees I/O errors. So the
+# folder is rescanned again after that.
+USB_RESCAN_S = 90
 
 # Button codes sent by the sketch (must match sketch.ino)
 CMD_TOGGLE, CMD_NEXT, CMD_PREV = 1, 2, 3
 
 # Menu lists (must match the sketch's enum)
-L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD = 1, 2, 3, 4, 5, 6
+L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD, L_USB = 1, 2, 3, 4, 5, 6, 7
 PAGE = 8                     # rows on the screen
 ITEM_LIMIT = 64              # bytes per menu row
 CURRENT = "\x10"             # glyph 16 in the sketch's font: a small play triangle
@@ -50,6 +62,7 @@ CURRENT = "\x10"             # glyph 16 in the sketch's font: a small play trian
 # Field limits in bytes. One Bridge message must fit in 256 bytes.
 LIMITS = {"src": 7, "fmt": 15, "artist": 44, "title": 64, "album": 52}
 
+STREAM_CODECS = {"MP3", "OGG", "OGA", "OPUS", "AAC", "M4A"}
 LOSSLESS = {"FLAC", "WAV", "AIFF", "AIF", "APE", "WV", "ALAC", "DSF", "DFF", "CD"}
 
 
@@ -171,6 +184,7 @@ class Library:
         self.artists = []          # names
         self.by_artist = {}        # name -> [album, ...] sorted by year
         self.albums = []           # every album, sorted by name
+        self.usb_albums = []       # albums on the USB stick
 
     def load(self, mpd):
         groups = {}
@@ -195,6 +209,8 @@ class Library:
         for albums in self.by_artist.values():
             albums.sort(key=lambda a: (a["year"] or 9999, fold(a["name"])))
         self.artists = sorted(self.by_artist, key=fold)
+        self.usb_albums = [a for a in self.albums
+                           if a["files"] and a["files"][0].startswith(USB_DIR + "/")]
         print(f"[mpdui] library: {len(self.artists)} artists, {len(self.albums)} albums")
 
 
@@ -220,6 +236,38 @@ def fit(text, limit):
     return text.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
 
 
+def devices(sys_block="/sys/class/block"):
+    """dev(mask) bits for what is plugged in. The container sees the host's
+    /sys: sr0 is the CD drive, and the stick is the partition named "rips".
+    Reading these few small files costs microseconds and never touches
+    the devices themselves."""
+    try:
+        names = os.listdir(sys_block)
+    except OSError:
+        names = []
+    # sr0, or sr1 after a USB reset re-attaches the drive
+    mask = DEV_CD if any(n.startswith("sr") for n in names) else 0
+    for name in (n for n in names if n.startswith("sd")):
+        try:
+            with open(os.path.join(sys_block, name, "uevent")) as f:
+                if f"PARTNAME={USB_PART}" in f.read().splitlines():
+                    mask |= DEV_USB
+                    break
+        except OSError:
+            pass
+    return mask
+
+
+def cd_uri(n):
+    """MPD's URI of audio CD track n (1-based)."""
+    return f"cdda:///{n}"
+
+
+def cd_track(path):
+    """Track number of a cdda:/// URI, 0 for anything else."""
+    return number(path[8:]) if path.startswith("cdda:///") else 0
+
+
 def extension(path):
     name = path.rsplit("/", 1)[-1]
     return name.rsplit(".", 1)[-1].upper() if "." in name else ""
@@ -232,7 +280,10 @@ def describe_format(song, status, codec=None):
     if codec is not None:
         pass
     elif path.startswith(("http://", "https://")):
-        codec = "FLAC" if "flac" in path.lower() else ""
+        # Streams: a hint in the URL (".../flacm", "stream.ogg", "x.mp3"), if any
+        url = path.lower().split("?", 1)[0]
+        ext = extension(url)
+        codec = ("FLAC" if "flac" in url else ext if ext in STREAM_CODECS else "")
     elif path.startswith("cdda://"):
         codec = "CD"
     else:
@@ -251,8 +302,8 @@ def describe_format(song, status, codec=None):
         khz = rate // 1000
         return f"{codec} {bits}/{khz}" if bits.isdigit() else f"{codec} {khz}k"
     bitrate = status.get("bitrate", "0")
-    if codec and bitrate not in ("", "0"):
-        return f"{codec} {bitrate}"
+    if bitrate not in ("", "0"):
+        return f"{codec} {bitrate}" if codec else f"{bitrate} kbps"
     if bits.isdigit() and rate:                  # codec unknown: at least 16/44
         return f"{bits}/{rate // 1000}"
     return codec
@@ -272,8 +323,10 @@ def describe_track(song, status, radio, codec=None):
         return ("RADIO", fmt, artist, title, station, 0, 0, 0, 0, 1)
 
     artist = song.get("Artist") or song.get("AlbumArtist") or ""
-    title = song.get("Title") or os.path.splitext(path.rsplit("/", 1)[-1])[0]
-    album = song.get("Album", "")
+    cd = cd_track(path)
+    title = (song.get("Title") or (f"Track {cd}" if cd else
+                                   os.path.splitext(path.rsplit("/", 1)[-1])[0]))
+    album = song.get("Album") or ("Audio CD" if cd else "")
     m = re.match(r"\d{4}", song.get("Date", ""))
     year = int(m.group()) if m else 0
     no, of = 0, 0
@@ -282,20 +335,32 @@ def describe_track(song, status, radio, codec=None):
         a, _, b = track.partition("/")
         no = int(a) if a.isdigit() else 0
         of = int(b) if b.isdigit() else 0
+    no = no or cd
     try:
         dur = int(float(song.get("duration") or song.get("Time") or 0))
     except ValueError:
         dur = 0
-    src = "CD" if path.startswith("cdda://") else "NAS"
+    # music_directory holds nas/ (the QNAP over NFS) and rips/ (the USB stick)
+    src = ("CD" if path.startswith("cdda://") else
+           "USB" if path.startswith("rips/") else "NAS")
     return (src, fmt, artist, title, album, year, no, of, dur, 0)
 
 
 def describe_status(status):
+    """st message: state (0 stop, 1 play, 2 pause, 3 play but no sound yet),
+    elapsed s, volume, repeat, random, song position."""
     state = {"play": 1, "pause": 2}.get(status.get("state"), 0)
     try:
-        elapsed = int(float(status.get("elapsed", 0)))
+        exact = float(status.get("elapsed", 0))
     except ValueError:
-        elapsed = 0
+        exact = 0.0
+    elapsed = int(exact)
+    # Right after play/next MPD already says "play", but a CD track (or a
+    # stream) may need seconds before sound starts. Counting the time on the
+    # MCU then made it run and jump back to 0; state 3 shows "playing" but
+    # holds the time until MPD's own clock moves.
+    if state == 1 and exact == 0.0:
+        state = 3
     try:
         volume = int(status.get("volume", -1))
     except ValueError:
@@ -324,6 +389,11 @@ class Controller:
         self.radio = load_radio()
         self.library = Library()
         self.cue_codecs = {}         # CUE sheet path -> codec of its audio file
+        self.cd_count = 0            # audio tracks on the disc (see _cd_tracks)
+        self.dev = None              # last dev(mask) sent
+        self.rescan_at = 0           # when to rescan the stick's folder again
+        self.starting = False        # playing, but no sound yet (state 3)
+        self.cd_checked = -CD_CACHE_S
         self.mpd = Mpd()             # commands and status (shared, under lock)
         self.lock = threading.Lock()
         self.events = queue.Queue()
@@ -361,7 +431,9 @@ class Controller:
                       fit(artist, LIMITS["artist"]), fit(title, LIMITS["title"]),
                       fit(album, LIMITS["album"]), *nums)
             self.last_trk = trk
-        self.send("st", *describe_status(status))
+        st = describe_status(status)
+        self.starting = st[0] == 3
+        self.send("st", *st)
         return status
 
     def _cue_codec(self, path):
@@ -374,11 +446,31 @@ class Controller:
         if cue not in self.cue_codecs:
             folder, _, sheet = cue.rpartition("/")
             stem = sheet[:-4].casefold()
+            skip = ("", "CUE", "LOG", "TXT", "JPG", "PNG", "M3U", "M3U8", "TOC", "NFO")
             files = [v for k, v in self.mpd.lines(f"lsinfo {quote(folder)}") if k == "file"]
-            audio = [f for f in files if extension(f) not in ("", "CUE", "LOG", "TXT", "JPG", "PNG")]
+            audio = [f for f in files if extension(f) not in skip]
+            if not audio:
+                # MPD 0.24 hides the files a CUE sheet refers to (e.g. whipper's
+                # per-track FLACs next to its .cue); listfiles still shows them.
+                files = [v for k, v in self.mpd.lines(f"listfiles {quote(folder)}") if k == "file"]
+                audio = [f for f in files if extension(f) not in skip]
             same = [f for f in audio if f.rsplit("/", 1)[-1].casefold().startswith(stem + ".")]
             self.cue_codecs[cue] = extension((same or audio or [""])[0])
         return self.cue_codecs[cue]
+
+    def push_devices(self, force=False):
+        """Send dev(mask) when a device comes or goes. The stick: also have
+        MPD rescan its folder, so its albums appear or disappear."""
+        mask = devices()
+        if force or mask != self.dev:
+            self.send("dev", mask)
+            if self.dev is not None and (mask ^ self.dev) & DEV_USB:
+                self.events.put(("update", USB_DIR))
+                self.rescan_at = time.monotonic() + USB_RESCAN_S
+            self.dev = mask
+        if self.rescan_at and time.monotonic() >= self.rescan_at:
+            self.rescan_at = 0
+            self.events.put(("update", USB_DIR))
 
     def push_clock(self, force=False):
         minute = local_minutes()
@@ -406,16 +498,21 @@ class Controller:
         """Clock every minute; status every few seconds while playing (keeps the
         elapsed time honest and picks up the audio format, which MPD only knows
         a moment after a track starts)."""
-        last_refresh = 0.0
+        last_refresh = last_dev = 0.0
         while True:
             try:
                 self.push_clock()
+                if time.monotonic() - last_dev >= DEV_POLL_S:
+                    last_dev = time.monotonic()
+                    self.push_devices()
                 if time.monotonic() - last_refresh >= REFRESH_S:
                     last_refresh = time.monotonic()
                     with self.lock:
                         playing = self.mpd.command("status").get("state") == "play"
                     if playing:
                         self.push()
+                elif self.starting:              # waiting for sound: look every second
+                    self.push()
             except Exception as exc:
                 print(f"[mpdui] tick: {exc}")
             time.sleep(1)
@@ -444,6 +541,10 @@ class Controller:
                     self.radio = load_radio()
                     self.push(force=True)
                     self.push_clock(force=True)
+                    self.push_devices(force=True)
+                elif kind == "update":
+                    with self.lock:
+                        self.mpd.command(f"update {quote(value)}")
                 elif kind == "reload":
                     with self.lock:
                         self.library.load(self.mpd)
@@ -477,8 +578,10 @@ class Controller:
                     text = self.radio.get(path) or song.get("Name") or path
                 else:
                     artist, title = song.get("Artist", ""), song.get("Title", "")
+                    cd = cd_track(path)
                     text = (f"{artist} - {title}" if artist and title
-                            else title or os.path.splitext(path.rsplit("/", 1)[-1])[0])
+                            else title or (f"CD track {cd}" if cd else
+                                           os.path.splitext(path.rsplit("/", 1)[-1])[0]))
                 rows.append((CURRENT if str(i) == current else " ") + text)
             return rows
         if lst == L_ARTISTS:
@@ -488,11 +591,58 @@ class Controller:
             return [a["name"] for a in albums]
         if lst == L_ALBUMS:
             return [a["name"] for a in lib.albums]
+        if lst == L_USB:
+            return [a["name"] for a in lib.usb_albums]
         if lst == L_RADIO:
             with self.lock:
                 playing = self.mpd.command("currentsong").get("file", "")
             return [(CURRENT if url == playing else " ") + name for url, name in self.radio.items()]
+        if lst == L_CD:
+            count = self._cd_tracks()
+            if not count:
+                return []                    # the sketch shows "No disc"
+            with self.lock:
+                playing = self.mpd.command("currentsong").get("file", "")
+            return [" Play disc"] + [(CURRENT if playing == cd_uri(n) else " ") + f"Track {n}"
+                                     for n in range(1, count + 1)]
         return []
+
+    def _cd_tracks(self):
+        """Audio tracks on the disc, 0 if there is none. MPD can play
+        cdda:///N but can't list a disc, so probe: `lsinfo cdda:///N` fails
+        with "No such file" for a track that exists (no tags) and with
+        "Error ... on track N" past the last one. Kept for a few seconds so
+        paging through the list doesn't probe again."""
+        if time.monotonic() - self.cd_checked < CD_CACHE_S:
+            return self.cd_count
+        with self.lock:
+            def exists(n):
+                try:
+                    self.mpd.lines(f"lsinfo {quote(cd_uri(n))}")
+                    return True
+                except RuntimeError as exc:
+                    if "on track" in str(exc):
+                        return False
+                    if "[50@" in str(exc):
+                        return True
+                    raise                    # no disc, drive not ready
+            try:
+                if not exists(1):
+                    count = 0
+                else:
+                    lo, hi = 1, 2            # lo exists; grow hi until it doesn't
+                    while hi <= 99 and exists(hi):
+                        lo, hi = hi, hi * 2
+                    hi = min(hi, 100)
+                    while hi - lo > 1:       # last existing track in (lo, hi)
+                        mid = (lo + hi) // 2
+                        lo, hi = (mid, hi) if exists(mid) else (lo, mid)
+                    count = lo
+            except RuntimeError as exc:
+                print(f"[mpdui] cd: {exc}")
+                count = 0
+        self.cd_count, self.cd_checked = count, time.monotonic()
+        return count
 
     def _page(self, lst, ctx, start):
         rows = self._rows(lst, ctx)
@@ -510,12 +660,27 @@ class Controller:
             return albums[index]["files"] if index < len(albums) else []
         if lst == L_ALBUMS and index < len(lib.albums):
             return lib.albums[index]["files"]
+        if lst == L_USB and index < len(lib.usb_albums):
+            return lib.usb_albums[index]["files"]
         if lst == L_RADIO:
             urls = list(self.radio)
             return [urls[index]] if index < len(urls) else []
         return []
 
     def _select(self, lst, ctx, index, action):
+        if lst == L_CD:
+            count = self._cd_tracks()
+            if not count or index > count:
+                return
+            whole = [f"add {quote(cd_uri(n))}" for n in range(1, count + 1)]
+            with self.lock:
+                if action == 0:              # the whole disc, from this track
+                    self.mpd.batch(["clear"] + whole + [f"play {max(0, index - 1)}"])
+                elif index == 0:
+                    self.mpd.batch(whole)
+                else:
+                    self.mpd.command(f"add {quote(cd_uri(index))}")
+            return
         with self.lock:
             if lst == L_QUEUE:
                 if action == 0:

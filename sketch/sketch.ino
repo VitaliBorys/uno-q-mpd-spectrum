@@ -195,14 +195,18 @@ struct NowInfo {
   bool radio;
 };
 
-enum { L_ROOT, L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD };
+enum { L_ROOT, L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD, L_USB };
 enum { V_NOW, V_SPECTRUM, V_VU, V_EYE };
 
 // ---- Menu ----------------------------------------------------------------
 // List ids, shared with Python: 1 queue, 2 artists, 3 an artist's albums,
 // 4 albums, 5 radio, 6 CD. The top level (0) is drawn by the sketch itself.
-const char *const ROOT_ITEMS[] = {"Queue", "Artists", "Albums", "Radio", "CD"};
-const uint8_t ROOT_LISTS[] = {L_QUEUE, L_ARTISTS, L_ALBUMS, L_RADIO, L_CD};
+const char *const ROOT_ITEMS[] = {"Queue", "Artists", "Albums", "Radio", "CD", "USB"};
+const uint8_t ROOT_LISTS[] = {L_QUEUE, L_ARTISTS, L_ALBUMS, L_RADIO, L_CD, L_USB};
+const int ROOT_N = sizeof(ROOT_LISTS) / sizeof(ROOT_LISTS[0]);
+// Devices Python reports with dev(mask); a root item whose device is missing
+// is drawn dim and only shows a hint.
+const int DEV_CD = 1, DEV_USB = 2;
 
 // ---- Display, colours ----------------------------------------------------
 FastTFT tft(240, 320, TFT_CS, TFT_DC, TFT_RST);
@@ -245,7 +249,7 @@ const int ROWS = 8, ROW_Y0 = 24, ROW_H = 21, ROW_W = 306;
 NowInfo now;
 int curSong = -1;                // queue position of the current song, from MPD
 bool playing = false;
-int mpdState = 0;                // 0 stop, 1 play, 2 pause
+int mpdState = 0;                // 0 stop, 1 play, 2 pause, 3 play without sound yet
 bool rptOn = false, rndOn = false;
 int elapsed = 0;
 unsigned long tickAt = 0;
@@ -265,6 +269,8 @@ volatile bool inStNew = false;
 uint8_t inLv[18];
 volatile bool inLvNew = false;
 volatile int inClk = -1;
+volatile int inDev = -1;
+int devMask = DEV_CD | DEV_USB;            // until Python says otherwise
 InItem inQ[16];                  // menu page/item messages, a small ring buffer
 volatile uint8_t inQHead = 0, inQTail = 0;
 char pageText[8][68];            // the 8 rows on screen
@@ -511,7 +517,7 @@ void showMs(unsigned long ms) {
 // ---- Header and footer (views) -------------------------------------------
 void headerLeft() {
   char b[16];
-  snprintf(b, sizeof(b), "%s %s", now.src, mpdState == 1 ? "\x10" : mpdState == 2 ? "||" : "--");
+  snprintf(b, sizeof(b), "%s %s", now.src, playing ? "\x10" : mpdState == 2 ? "||" : "--");
   textBox(0, 0, 106, HEAD_H, 6, 3, b, 2, VFD, BLACK);
 }
 
@@ -582,7 +588,7 @@ void drawProgress(int x, int y, int w, bool full) {
 // ---- View 1: Now playing -------------------------------------------------
 void nowState() {
   textBox(0, 122, 200, 20, 8, 2,
-          mpdState == 1 ? "\x10 PLAYING" : mpdState == 2 ? "|| PAUSED" : "-- STOPPED", 2, VFD, BLACK);
+          playing ? "\x10 PLAYING" : mpdState == 2 ? "|| PAUSED" : "-- STOPPED", 2, VFD, BLACK);
   char b[24];
   if (now.radio) snprintf(b, sizeof(b), "LIVE");
   else snprintf(b, sizeof(b), "RPT %s  RND %s", rptOn ? "on " : "off", rndOn ? "on " : "off");
@@ -1207,6 +1213,7 @@ void onLv(std::vector<uint8_t> v) {
 }
 
 void onClk(int minutes) { inClk = minutes; }
+void onDev(int mask) { inDev = mask; }
 
 void pushItem(int8_t kind, int list, int ctx, int index, int total, const char *text) {
   noInterrupts();
@@ -1252,9 +1259,10 @@ void applyStatus() {
   inStNew = false;
   interrupts();
   bool stateChanged = s[0] != mpdState || (s[3] != 0) != rptOn || (s[4] != 0) != rndOn;
-  if (s[0] != 1 && mpdState == 1) pausedSince = millis();
+  bool was = playing;
   mpdState = s[0];
-  playing = mpdState == 1;
+  playing = mpdState == 1 || mpdState == 3;
+  if (was && !playing) pausedSince = millis();
   rptOn = s[3]; rndOn = s[4];
   curSong = s[5];
   elapsed = s[1];
@@ -1273,6 +1281,7 @@ void applyStatus() {
 }
 
 void applyMenuItem(const InItem &it);
+void menuDevicesChanged();
 
 void applyInbox() {
   while (inQTail != inQHead) {
@@ -1298,6 +1307,10 @@ void applyInbox() {
     clockBase = inClk; clockAt = millis(); inClk = -1;
     if (!inMenu && !idle) headerClock();
   }
+  if (inDev >= 0) {
+    int m = inDev; inDev = -1;
+    if (m != devMask) { devMask = m; menuDevicesChanged(); }
+  }
 }
 
 // ---- Commands to Python ------------------------------------------------------
@@ -1307,16 +1320,15 @@ void sendCmd(int code) { Bridge.notify("cmd", code); }
 
 // ---- Menu data -----------------------------------------------------------
 int listCount(const Level &l) {
-  if (l.id == L_ROOT) return 5;
-  if (l.id == L_CD) return 1;
+  if (l.id == L_ROOT) return ROOT_N;
   return l.total;                              // -1 until Python answers
 }
 
 void listLabel(const Level &l, int i, char *out, size_t n) {
   int row = i - i / ROWS * ROWS;
   if (l.id == L_ROOT) snprintf(out, n, "%s", ROOT_ITEMS[i]);
-  else if (l.id == L_CD) snprintf(out, n, "No disc");
-  else if (l.total == 0) snprintf(out, n, "(empty)");
+  else if (l.total == 0) snprintf(out, n, l.id == L_CD ? "No disc" : "(empty)");
+  else if (l.total < 0 && l.id == L_CD) snprintf(out, n, "Reading disc...");
   else snprintf(out, n, "%s", pageHave[row] ? pageText[row] : "...");
 }
 
@@ -1328,12 +1340,21 @@ const char *listTitle(const Level &l) {
     case L_ARTIST_ALBUMS: return l.title;
     case L_ALBUMS: return "ALBUMS";
     case L_RADIO: return "RADIO";
+    case L_USB: return "USB";
     default: return "CD";
   }
 }
 
 bool opensSubmenu(const Level &l) { return l.id == L_ROOT || l.id == L_ARTISTS; }
-bool fromPython(const Level &l) { return l.id != L_ROOT && l.id != L_CD; }
+bool fromPython(const Level &l) { return l.id != L_ROOT; }
+
+// Root items for devices that are not connected: drawn dim, no submenu.
+bool rootAvailable(int i) {
+  uint8_t id = ROOT_LISTS[i];
+  if (id == L_CD) return devMask & DEV_CD;
+  if (id == L_USB) return devMask & DEV_USB;
+  return true;
+}
 
 // ---- Menu drawing --------------------------------------------------------
 int pageTop(int c) { return c / ROWS * ROWS; }
@@ -1362,15 +1383,17 @@ void menuRow(int i) {
   }
   char b[64];
   listLabel(l, idx, b, sizeof(b));
+  bool off = l.id == L_ROOT && !rootAvailable(idx);
+  uint16_t fg = off ? LINE : VFD, bar = off ? MUTED : VFD;
   if (idx == l.cursor) {
     tft.fillRect(0, y, 6, ROW_H, BLACK);
-    textBox(6, y, ROW_W - 6, ROW_H - 1, 6, 2, b, 2, BLACK, VFD);
+    textBox(6, y, ROW_W - 6, ROW_H - 1, 6, 2, b, 2, BLACK, bar);
     tft.fillRect(6, y + ROW_H - 1, ROW_W - 6, 1, BLACK);
-    if (opensSubmenu(l)) textBox(ROW_W - 18, y, 12, ROW_H - 1, 0, 2, ">", 2, BLACK, VFD);
+    if (opensSubmenu(l) && !off) textBox(ROW_W - 18, y, 12, ROW_H - 1, 0, 2, ">", 2, BLACK, bar);
     rowW[i] = ROW_W;
   } else {
     int w = imin(ROW_W, 12 + u8len(b) * 12);
-    textBox(0, y, imax(w, rowW[i]), ROW_H, 12, 2, b, 2, VFD, BLACK);
+    textBox(0, y, imax(w, rowW[i]), ROW_H, 12, 2, b, 2, fg, BLACK);
     rowW[i] = w;
   }
 }
@@ -1385,6 +1408,13 @@ void menuScrollbar() {
   int ty = y + (long)(h - th) * (pageTop(l.cursor) / ROWS) / (pages - 1);
   tft.fillRect(x, y, 3, h, DIM);
   tft.fillRect(x, ty, 3, th, MUTED);
+}
+
+void menuRows();
+
+// dev(mask) arrived: only the root page shows it.
+void menuDevicesChanged() {
+  if (inMenu && !idle && depth == 0) menuRows();
 }
 
 void menuHint() {
@@ -1435,7 +1465,7 @@ void menuEnter() {
   inMenu = true;
   mq.on = false;
   depth = 0;
-  st[0] = {L_ROOT, 0, 0, 5, ""};
+  st[0] = {L_ROOT, 0, 0, ROOT_N, ""};
   eraseView(view);
   for (int i = 0; i < ROWS; i++) rowW[i] = 0;       // rows area is black now
   tft.fillRect(276, 204, 44, 24, BLACK);           // volume number
@@ -1445,11 +1475,16 @@ void menuEnter() {
   showMs(millis() - t0);
 }
 
+// A hint left over from the previous list would be misleading.
+void clearToast() {
+  if (toastUntil) { toastUntil = 0; menuHint(); }
+}
+
 void menuOpen(uint8_t id, int ctx, int cursor) {
   unsigned long t0 = millis();
+  clearToast();
   depth++;
   st[depth] = {id, ctx, cursor, -1, ""};
-  if (id == L_CD) st[depth].total = 1;
   requestPage();
   menuHeader();
   menuRows();
@@ -1472,6 +1507,7 @@ void menuExit(int newView) {
 void menuBack() {
   if (depth == 0) { menuExit(-1); return; }
   unsigned long t0 = millis();
+  clearToast();
   depth--;
   requestPage();                               // only one page is kept: fetch it again
   menuHeader();
@@ -1507,10 +1543,10 @@ void menuSelect() {
   switch (l.id) {
     case L_ROOT: {
       uint8_t id = ROOT_LISTS[i];
+      if (!rootAvailable(i)) { toast(id == L_CD ? "No CD drive" : "No USB stick"); break; }
       menuOpen(id, 0, id == L_QUEUE && curSong >= 0 ? curSong : 0);
       break;
     }
-    case L_CD: toast("No disc"); break;
     case L_ARTISTS: {
       int row = i - pageTop(i);
       if (!pageHave[row]) break;               // not loaded yet
@@ -1531,7 +1567,7 @@ void menuSelect() {
 
 void menuLong() {
   Level &l = st[depth];
-  if (l.id == L_ROOT || l.id == L_QUEUE || l.id == L_CD || listCount(l) <= 0) return;
+  if (l.id == L_ROOT || l.id == L_QUEUE || listCount(l) <= 0) return;
   Bridge.notify("sel", (int)l.id, l.ctx, l.cursor, 1);
   toast("Added to queue");
 }
@@ -1564,10 +1600,14 @@ void handleInput() {
   if (any) lastInputAt = millis();
   if (idle) {                      // any input only wakes the screen
     if (any) {
-      exitIdle();
+      // Take everything from the snapshot above, before the slow redraw: a
+      // release during exitIdle() must still be seen as the end of this press.
+      // (Reading pushDown after the redraw left releasesDone one behind for
+      // good, and no click registered any more.)
       pressesDone = pc; releasesDone = rc; k0Done = kc;
-      logicDown = pushDown;
-      swallowRelease = pushDown;   // the press that woke it is not a click
+      logicDown = pc != rc;
+      swallowRelease = logicDown;  // the press that woke it is not a click
+      exitIdle();
     }
     return;
   }
@@ -1596,6 +1636,8 @@ void handleInput() {
       logicDown = false;
       if (swallowRelease) swallowRelease = false;
       else if (!turned && holdCount == 0 && rAt - pAt < HOLD_MS) onShort();
+    } else if (!logicDown && releasesDone != rc) {
+      releasesDone = rc;           // a release without its press: resync
     } else break;
   }
 
@@ -1644,6 +1686,7 @@ void setup() {
   Bridge.provide("st", onSt);
   Bridge.provide("lv", onLv);
   Bridge.provide("clk", onClk);
+  Bridge.provide("dev", onDev);
   Bridge.provide("page", onPage);
   Bridge.provide("item", onItem);
   Bridge.notify("hello");       // Python answers with the full state
@@ -1657,7 +1700,7 @@ void loop() {
 
   // Time runs on locally between status messages.
   unsigned long t = millis();
-  if (playing && t - tickAt >= 1000) {
+  if (mpdState == 1 && t - tickAt >= 1000) {     // state 3: no sound yet, hold the time
     tickAt += 1000;
     if (now.dur == 0 || elapsed < now.dur) elapsed++;
     onTimeTick();

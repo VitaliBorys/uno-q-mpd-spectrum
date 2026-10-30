@@ -8,3 +8,14 @@ __pycache__/
 
 # App Lab runtime data
 data/
+
+# tools/cdrom-modules build output and downloaded sources
+tools/cdrom-modules/*.o
+tools/cdrom-modules/*.ko
+tools/cdrom-modules/*.mod
+tools/cdrom-modules/*.mod.c
+tools/cdrom-modules/.*.cmd
+tools/cdrom-modules/Module.symvers
+tools/cdrom-modules/modules.order
+tools/cdrom-modules/*.c
+tools/cdrom-modules/*.h
