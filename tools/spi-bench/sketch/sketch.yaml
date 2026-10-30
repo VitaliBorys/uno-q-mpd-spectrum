@@ -1,0 +1,11 @@
+profiles:
+  default:
+    fqbn:
+    platforms:
+      - platform: arduino:zephyr
+    libraries:
+      - dependency: Adafruit BusIO (1.17.4)
+      - Adafruit GFX Library (1.13.0)
+      - DIYables TFT SPI (1.0.3)
+
+default_profile: default
