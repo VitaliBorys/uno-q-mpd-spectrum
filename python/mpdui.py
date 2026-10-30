@@ -5,6 +5,7 @@ MPD side of the physical controller (TFT + knob + buttons on the MCU).
     trk(src, fmt, artist, title, album, year, no, of, dur, radio)
     st(state, elapsed, volume, repeat, random, song)
     clk(minutes since midnight)
+    dev(mask)     CD drive (1) and USB stick (2) present
 - Turns knob and button events from the MCU into MPD commands:
     vol(clicks)   cmd(code)   hello()
 - Serves the menu one page at a time:
@@ -38,12 +39,18 @@ VOLUME_STEP = 2              # percent per knob click (must match the sketch)
 RADIO_FILE = "/app/radio.txt"
 REFRESH_S = 5                # re-send the status this often while playing
 CD_CACHE_S = 5               # how long a probe of the disc stays valid
+DEV_POLL_S = 2               # how often to look for the CD drive and the USB stick
+
+# Devices, as the dev(mask) bits (must match the sketch)
+DEV_CD, DEV_USB = 1, 2
+USB_PART = "rips"            # GPT partition name of the stick with the rips
+USB_DIR = "rips"             # its folder in MPD's music_directory
 
 # Button codes sent by the sketch (must match sketch.ino)
 CMD_TOGGLE, CMD_NEXT, CMD_PREV = 1, 2, 3
 
 # Menu lists (must match the sketch's enum)
-L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD = 1, 2, 3, 4, 5, 6
+L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD, L_USB = 1, 2, 3, 4, 5, 6, 7
 PAGE = 8                     # rows on the screen
 ITEM_LIMIT = 64              # bytes per menu row
 CURRENT = "\x10"             # glyph 16 in the sketch's font: a small play triangle
@@ -173,6 +180,7 @@ class Library:
         self.artists = []          # names
         self.by_artist = {}        # name -> [album, ...] sorted by year
         self.albums = []           # every album, sorted by name
+        self.usb_albums = []       # albums on the USB stick
 
     def load(self, mpd):
         groups = {}
@@ -197,6 +205,8 @@ class Library:
         for albums in self.by_artist.values():
             albums.sort(key=lambda a: (a["year"] or 9999, fold(a["name"])))
         self.artists = sorted(self.by_artist, key=fold)
+        self.usb_albums = [a for a in self.albums
+                           if a["files"] and a["files"][0].startswith(USB_DIR + "/")]
         print(f"[mpdui] library: {len(self.artists)} artists, {len(self.albums)} albums")
 
 
@@ -220,6 +230,27 @@ def load_radio(path=RADIO_FILE):
 def fit(text, limit):
     """Cut a string to at most `limit` UTF-8 bytes without splitting a character."""
     return text.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+
+
+def devices(sys_block="/sys/class/block"):
+    """dev(mask) bits for what is plugged in. The container sees the host's
+    /sys: sr0 is the CD drive, and the stick is the partition named "rips".
+    Reading these few small files costs microseconds and never touches
+    the devices themselves."""
+    mask = DEV_CD if os.path.exists(os.path.join(sys_block, "sr0")) else 0
+    try:
+        names = [n for n in os.listdir(sys_block) if n.startswith("sd")]
+    except OSError:
+        names = []
+    for name in names:
+        try:
+            with open(os.path.join(sys_block, name, "uevent")) as f:
+                if f"PARTNAME={USB_PART}" in f.read().splitlines():
+                    mask |= DEV_USB
+                    break
+        except OSError:
+            pass
+    return mask
 
 
 def cd_uri(n):
@@ -345,6 +376,7 @@ class Controller:
         self.library = Library()
         self.cue_codecs = {}         # CUE sheet path -> codec of its audio file
         self.cd_count = 0            # audio tracks on the disc (see _cd_tracks)
+        self.dev = None              # last dev(mask) sent
         self.cd_checked = -CD_CACHE_S
         self.mpd = Mpd()             # commands and status (shared, under lock)
         self.lock = threading.Lock()
@@ -408,6 +440,16 @@ class Controller:
             self.cue_codecs[cue] = extension((same or audio or [""])[0])
         return self.cue_codecs[cue]
 
+    def push_devices(self, force=False):
+        """Send dev(mask) when a device comes or goes. The stick: also have
+        MPD rescan its folder, so its albums appear or disappear."""
+        mask = devices()
+        if force or mask != self.dev:
+            self.send("dev", mask)
+            if self.dev is not None and (mask ^ self.dev) & DEV_USB:
+                self.events.put(("update", USB_DIR))
+            self.dev = mask
+
     def push_clock(self, force=False):
         minute = local_minutes()
         if force or minute != self.last_minute:
@@ -434,10 +476,13 @@ class Controller:
         """Clock every minute; status every few seconds while playing (keeps the
         elapsed time honest and picks up the audio format, which MPD only knows
         a moment after a track starts)."""
-        last_refresh = 0.0
+        last_refresh = last_dev = 0.0
         while True:
             try:
                 self.push_clock()
+                if time.monotonic() - last_dev >= DEV_POLL_S:
+                    last_dev = time.monotonic()
+                    self.push_devices()
                 if time.monotonic() - last_refresh >= REFRESH_S:
                     last_refresh = time.monotonic()
                     with self.lock:
@@ -472,6 +517,10 @@ class Controller:
                     self.radio = load_radio()
                     self.push(force=True)
                     self.push_clock(force=True)
+                    self.push_devices(force=True)
+                elif kind == "update":
+                    with self.lock:
+                        self.mpd.command(f"update {quote(value)}")
                 elif kind == "reload":
                     with self.lock:
                         self.library.load(self.mpd)
@@ -518,6 +567,8 @@ class Controller:
             return [a["name"] for a in albums]
         if lst == L_ALBUMS:
             return [a["name"] for a in lib.albums]
+        if lst == L_USB:
+            return [a["name"] for a in lib.usb_albums]
         if lst == L_RADIO:
             with self.lock:
                 playing = self.mpd.command("currentsong").get("file", "")
@@ -585,6 +636,8 @@ class Controller:
             return albums[index]["files"] if index < len(albums) else []
         if lst == L_ALBUMS and index < len(lib.albums):
             return lib.albums[index]["files"]
+        if lst == L_USB and index < len(lib.usb_albums):
+            return lib.usb_albums[index]["files"]
         if lst == L_RADIO:
             urls = list(self.radio)
             return [urls[index]] if index < len(urls) else []

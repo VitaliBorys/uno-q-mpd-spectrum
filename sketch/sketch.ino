@@ -195,14 +195,18 @@ struct NowInfo {
   bool radio;
 };
 
-enum { L_ROOT, L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD };
+enum { L_ROOT, L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD, L_USB };
 enum { V_NOW, V_SPECTRUM, V_VU, V_EYE };
 
 // ---- Menu ----------------------------------------------------------------
 // List ids, shared with Python: 1 queue, 2 artists, 3 an artist's albums,
 // 4 albums, 5 radio, 6 CD. The top level (0) is drawn by the sketch itself.
-const char *const ROOT_ITEMS[] = {"Queue", "Artists", "Albums", "Radio", "CD"};
-const uint8_t ROOT_LISTS[] = {L_QUEUE, L_ARTISTS, L_ALBUMS, L_RADIO, L_CD};
+const char *const ROOT_ITEMS[] = {"Queue", "Artists", "Albums", "Radio", "CD", "USB"};
+const uint8_t ROOT_LISTS[] = {L_QUEUE, L_ARTISTS, L_ALBUMS, L_RADIO, L_CD, L_USB};
+const int ROOT_N = sizeof(ROOT_LISTS) / sizeof(ROOT_LISTS[0]);
+// Devices Python reports with dev(mask); a root item whose device is missing
+// is drawn dim and only shows a hint.
+const int DEV_CD = 1, DEV_USB = 2;
 
 // ---- Display, colours ----------------------------------------------------
 FastTFT tft(240, 320, TFT_CS, TFT_DC, TFT_RST);
@@ -265,6 +269,8 @@ volatile bool inStNew = false;
 uint8_t inLv[18];
 volatile bool inLvNew = false;
 volatile int inClk = -1;
+volatile int inDev = -1;
+int devMask = DEV_CD | DEV_USB;            // until Python says otherwise
 InItem inQ[16];                  // menu page/item messages, a small ring buffer
 volatile uint8_t inQHead = 0, inQTail = 0;
 char pageText[8][68];            // the 8 rows on screen
@@ -1207,6 +1213,7 @@ void onLv(std::vector<uint8_t> v) {
 }
 
 void onClk(int minutes) { inClk = minutes; }
+void onDev(int mask) { inDev = mask; }
 
 void pushItem(int8_t kind, int list, int ctx, int index, int total, const char *text) {
   noInterrupts();
@@ -1273,6 +1280,7 @@ void applyStatus() {
 }
 
 void applyMenuItem(const InItem &it);
+void menuDevicesChanged();
 
 void applyInbox() {
   while (inQTail != inQHead) {
@@ -1298,6 +1306,10 @@ void applyInbox() {
     clockBase = inClk; clockAt = millis(); inClk = -1;
     if (!inMenu && !idle) headerClock();
   }
+  if (inDev >= 0) {
+    int m = inDev; inDev = -1;
+    if (m != devMask) { devMask = m; menuDevicesChanged(); }
+  }
 }
 
 // ---- Commands to Python ------------------------------------------------------
@@ -1307,7 +1319,7 @@ void sendCmd(int code) { Bridge.notify("cmd", code); }
 
 // ---- Menu data -----------------------------------------------------------
 int listCount(const Level &l) {
-  if (l.id == L_ROOT) return 5;
+  if (l.id == L_ROOT) return ROOT_N;
   return l.total;                              // -1 until Python answers
 }
 
@@ -1327,12 +1339,21 @@ const char *listTitle(const Level &l) {
     case L_ARTIST_ALBUMS: return l.title;
     case L_ALBUMS: return "ALBUMS";
     case L_RADIO: return "RADIO";
+    case L_USB: return "USB";
     default: return "CD";
   }
 }
 
 bool opensSubmenu(const Level &l) { return l.id == L_ROOT || l.id == L_ARTISTS; }
 bool fromPython(const Level &l) { return l.id != L_ROOT; }
+
+// Root items for devices that are not connected: drawn dim, no submenu.
+bool rootAvailable(int i) {
+  uint8_t id = ROOT_LISTS[i];
+  if (id == L_CD) return devMask & DEV_CD;
+  if (id == L_USB) return devMask & DEV_USB;
+  return true;
+}
 
 // ---- Menu drawing --------------------------------------------------------
 int pageTop(int c) { return c / ROWS * ROWS; }
@@ -1361,15 +1382,17 @@ void menuRow(int i) {
   }
   char b[64];
   listLabel(l, idx, b, sizeof(b));
+  bool off = l.id == L_ROOT && !rootAvailable(idx);
+  uint16_t fg = off ? LINE : VFD, bar = off ? MUTED : VFD;
   if (idx == l.cursor) {
     tft.fillRect(0, y, 6, ROW_H, BLACK);
-    textBox(6, y, ROW_W - 6, ROW_H - 1, 6, 2, b, 2, BLACK, VFD);
+    textBox(6, y, ROW_W - 6, ROW_H - 1, 6, 2, b, 2, BLACK, bar);
     tft.fillRect(6, y + ROW_H - 1, ROW_W - 6, 1, BLACK);
-    if (opensSubmenu(l)) textBox(ROW_W - 18, y, 12, ROW_H - 1, 0, 2, ">", 2, BLACK, VFD);
+    if (opensSubmenu(l) && !off) textBox(ROW_W - 18, y, 12, ROW_H - 1, 0, 2, ">", 2, BLACK, bar);
     rowW[i] = ROW_W;
   } else {
     int w = imin(ROW_W, 12 + u8len(b) * 12);
-    textBox(0, y, imax(w, rowW[i]), ROW_H, 12, 2, b, 2, VFD, BLACK);
+    textBox(0, y, imax(w, rowW[i]), ROW_H, 12, 2, b, 2, fg, BLACK);
     rowW[i] = w;
   }
 }
@@ -1384,6 +1407,13 @@ void menuScrollbar() {
   int ty = y + (long)(h - th) * (pageTop(l.cursor) / ROWS) / (pages - 1);
   tft.fillRect(x, y, 3, h, DIM);
   tft.fillRect(x, ty, 3, th, MUTED);
+}
+
+void menuRows();
+
+// dev(mask) arrived: only the root page shows it.
+void menuDevicesChanged() {
+  if (inMenu && !idle && depth == 0) menuRows();
 }
 
 void menuHint() {
@@ -1434,7 +1464,7 @@ void menuEnter() {
   inMenu = true;
   mq.on = false;
   depth = 0;
-  st[0] = {L_ROOT, 0, 0, 5, ""};
+  st[0] = {L_ROOT, 0, 0, ROOT_N, ""};
   eraseView(view);
   for (int i = 0; i < ROWS; i++) rowW[i] = 0;       // rows area is black now
   tft.fillRect(276, 204, 44, 24, BLACK);           // volume number
@@ -1444,8 +1474,14 @@ void menuEnter() {
   showMs(millis() - t0);
 }
 
+// A hint left over from the previous list would be misleading.
+void clearToast() {
+  if (toastUntil) { toastUntil = 0; menuHint(); }
+}
+
 void menuOpen(uint8_t id, int ctx, int cursor) {
   unsigned long t0 = millis();
+  clearToast();
   depth++;
   st[depth] = {id, ctx, cursor, -1, ""};
   requestPage();
@@ -1470,6 +1506,7 @@ void menuExit(int newView) {
 void menuBack() {
   if (depth == 0) { menuExit(-1); return; }
   unsigned long t0 = millis();
+  clearToast();
   depth--;
   requestPage();                               // only one page is kept: fetch it again
   menuHeader();
@@ -1505,6 +1542,7 @@ void menuSelect() {
   switch (l.id) {
     case L_ROOT: {
       uint8_t id = ROOT_LISTS[i];
+      if (!rootAvailable(i)) { toast(id == L_CD ? "No CD drive" : "No USB stick"); break; }
       menuOpen(id, 0, id == L_QUEUE && curSong >= 0 ? curSong : 0);
       break;
     }
@@ -1641,6 +1679,7 @@ void setup() {
   Bridge.provide("st", onSt);
   Bridge.provide("lv", onLv);
   Bridge.provide("clk", onClk);
+  Bridge.provide("dev", onDev);
   Bridge.provide("page", onPage);
   Bridge.provide("item", onItem);
   Bridge.notify("hello");       // Python answers with the full state

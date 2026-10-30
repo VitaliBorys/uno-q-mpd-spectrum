@@ -14,7 +14,8 @@ whatever MPD is playing — CDs, FLAC/WAV files, CUE images or internet radio.
 - Now playing: artist, title, album, year, track, time, format (`FLAC 16/44`, `MP3 320`)
 - Three more views: a tape-deck spectrum, two VU meters, a 6E1P-style magic eye
 - Knob: volume; press: play/pause; hold: next track (repeats every second)
-- Menu: queue, artists, albums, internet radio
+- Menu: queue, artists, albums, internet radio, audio CD, the USB stick with CD rips
+  (CD and USB are greyed out while the drive or the stick is not plugged in)
 - Latin and Cyrillic titles; long titles scroll back and forth
 - After a minute without playback: the "digital rain", with the time showing through it
 
