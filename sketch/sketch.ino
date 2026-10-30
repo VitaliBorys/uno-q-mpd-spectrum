@@ -249,7 +249,7 @@ const int ROWS = 8, ROW_Y0 = 24, ROW_H = 21, ROW_W = 306;
 NowInfo now;
 int curSong = -1;                // queue position of the current song, from MPD
 bool playing = false;
-int mpdState = 0;                // 0 stop, 1 play, 2 pause
+int mpdState = 0;                // 0 stop, 1 play, 2 pause, 3 play without sound yet
 bool rptOn = false, rndOn = false;
 int elapsed = 0;
 unsigned long tickAt = 0;
@@ -517,7 +517,7 @@ void showMs(unsigned long ms) {
 // ---- Header and footer (views) -------------------------------------------
 void headerLeft() {
   char b[16];
-  snprintf(b, sizeof(b), "%s %s", now.src, mpdState == 1 ? "\x10" : mpdState == 2 ? "||" : "--");
+  snprintf(b, sizeof(b), "%s %s", now.src, playing ? "\x10" : mpdState == 2 ? "||" : "--");
   textBox(0, 0, 106, HEAD_H, 6, 3, b, 2, VFD, BLACK);
 }
 
@@ -588,7 +588,7 @@ void drawProgress(int x, int y, int w, bool full) {
 // ---- View 1: Now playing -------------------------------------------------
 void nowState() {
   textBox(0, 122, 200, 20, 8, 2,
-          mpdState == 1 ? "\x10 PLAYING" : mpdState == 2 ? "|| PAUSED" : "-- STOPPED", 2, VFD, BLACK);
+          playing ? "\x10 PLAYING" : mpdState == 2 ? "|| PAUSED" : "-- STOPPED", 2, VFD, BLACK);
   char b[24];
   if (now.radio) snprintf(b, sizeof(b), "LIVE");
   else snprintf(b, sizeof(b), "RPT %s  RND %s", rptOn ? "on " : "off", rndOn ? "on " : "off");
@@ -1259,9 +1259,10 @@ void applyStatus() {
   inStNew = false;
   interrupts();
   bool stateChanged = s[0] != mpdState || (s[3] != 0) != rptOn || (s[4] != 0) != rndOn;
-  if (s[0] != 1 && mpdState == 1) pausedSince = millis();
+  bool was = playing;
   mpdState = s[0];
-  playing = mpdState == 1;
+  playing = mpdState == 1 || mpdState == 3;
+  if (was && !playing) pausedSince = millis();
   rptOn = s[3]; rndOn = s[4];
   curSong = s[5];
   elapsed = s[1];
@@ -1699,7 +1700,7 @@ void loop() {
 
   // Time runs on locally between status messages.
   unsigned long t = millis();
-  if (playing && t - tickAt >= 1000) {
+  if (mpdState == 1 && t - tickAt >= 1000) {     // state 3: no sound yet, hold the time
     tickAt += 1000;
     if (now.dur == 0 || elapsed < now.dur) elapsed++;
     onTimeTick();

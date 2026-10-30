@@ -347,11 +347,20 @@ def describe_track(song, status, radio, codec=None):
 
 
 def describe_status(status):
+    """st message: state (0 stop, 1 play, 2 pause, 3 play but no sound yet),
+    elapsed s, volume, repeat, random, song position."""
     state = {"play": 1, "pause": 2}.get(status.get("state"), 0)
     try:
-        elapsed = int(float(status.get("elapsed", 0)))
+        exact = float(status.get("elapsed", 0))
     except ValueError:
-        elapsed = 0
+        exact = 0.0
+    elapsed = int(exact)
+    # Right after play/next MPD already says "play", but a CD track (or a
+    # stream) may need seconds before sound starts. Counting the time on the
+    # MCU then made it run and jump back to 0; state 3 shows "playing" but
+    # holds the time until MPD's own clock moves.
+    if state == 1 and exact == 0.0:
+        state = 3
     try:
         volume = int(status.get("volume", -1))
     except ValueError:
@@ -383,6 +392,7 @@ class Controller:
         self.cd_count = 0            # audio tracks on the disc (see _cd_tracks)
         self.dev = None              # last dev(mask) sent
         self.rescan_at = 0           # when to rescan the stick's folder again
+        self.starting = False        # playing, but no sound yet (state 3)
         self.cd_checked = -CD_CACHE_S
         self.mpd = Mpd()             # commands and status (shared, under lock)
         self.lock = threading.Lock()
@@ -421,7 +431,9 @@ class Controller:
                       fit(artist, LIMITS["artist"]), fit(title, LIMITS["title"]),
                       fit(album, LIMITS["album"]), *nums)
             self.last_trk = trk
-        self.send("st", *describe_status(status))
+        st = describe_status(status)
+        self.starting = st[0] == 3
+        self.send("st", *st)
         return status
 
     def _cue_codec(self, path):
@@ -499,6 +511,8 @@ class Controller:
                         playing = self.mpd.command("status").get("state") == "play"
                     if playing:
                         self.push()
+                elif self.starting:              # waiting for sound: look every second
+                    self.push()
             except Exception as exc:
                 print(f"[mpdui] tick: {exc}")
             time.sleep(1)
