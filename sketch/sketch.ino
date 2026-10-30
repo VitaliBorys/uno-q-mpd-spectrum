@@ -1599,10 +1599,14 @@ void handleInput() {
   if (any) lastInputAt = millis();
   if (idle) {                      // any input only wakes the screen
     if (any) {
-      exitIdle();
+      // Take everything from the snapshot above, before the slow redraw: a
+      // release during exitIdle() must still be seen as the end of this press.
+      // (Reading pushDown after the redraw left releasesDone one behind for
+      // good, and no click registered any more.)
       pressesDone = pc; releasesDone = rc; k0Done = kc;
-      logicDown = pushDown;
-      swallowRelease = pushDown;   // the press that woke it is not a click
+      logicDown = pc != rc;
+      swallowRelease = logicDown;  // the press that woke it is not a click
+      exitIdle();
     }
     return;
   }
@@ -1631,6 +1635,8 @@ void handleInput() {
       logicDown = false;
       if (swallowRelease) swallowRelease = false;
       else if (!turned && holdCount == 0 && rAt - pAt < HOLD_MS) onShort();
+    } else if (!logicDown && releasesDone != rc) {
+      releasesDone = rc;           // a release without its press: resync
     } else break;
   }
 
