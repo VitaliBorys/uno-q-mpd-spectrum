@@ -67,15 +67,25 @@ lists travel one row per message, a page (8 rows) at a time.
 
 UNO Q GPIO is 3.3 V: power the module from **3.3V**, not 5V.
 
-| Module | UNO Q | | Module | UNO Q |
-|---|---|---|---|---|
-| GND | GND | | BLK (backlight) | D6 |
-| VCC | 3.3V | | A (encoder) | D2 |
-| SCL | D13 | | B (encoder) | D3 |
-| SDA | D11 | | PUSH (encoder button) | D4 |
-| RES | D9 | | K0 (button) | D5 |
-| DC | D8 | | | |
-| CS | D10 | | | |
+In the order of the module's header (wire colours as in the photo):
+
+| Module | UNO Q | Wire |
+|---|---|---|
+| GND | GND | black |
+| VCC | 3.3V | red |
+| SCL | D13 | yellow |
+| SDA | D11 | orange |
+| RES | D9 | white |
+| DC | D8 | grey |
+| CS | D10 | purple |
+| BLK (backlight) | D6 | brown |
+| A (encoder) | D2 | green |
+| B (encoder) | D3 | blue |
+| PUSH (encoder button) | D4 | white |
+| K0 (button) | D5 | grey |
+
+RES/DC/CS are not in pin order (D9, D8, D10): the easiest place to cross two
+wires. With RES and DC swapped the screen stays dark.
 
 Without the module the app still works: the matrix shows the spectrum and
 the sketch simply has nothing to draw on.
