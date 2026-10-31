@@ -198,8 +198,7 @@ The rest are constants at the top of `python/main.py`:
 
 | Setting | Default | Effect |
 |---|---|---|
-| `FPS` | `50` | Analyses (lv messages) per second |
-| `VIS_DELAY` | `0.5` | Seconds the levels are held back to match the DAC's buffer (see below) |
+| `FPS` | `25` | Analyses (lv messages) per second |
 | `VU_REF_DBFS` | `-18.0` | Level that reads 0 VU on the meters |
 | `PROFILE` | `False` | Print per-stage timings (read, FFT, bridge) every 5 s |
 
@@ -235,10 +234,8 @@ takes ~35 ms; animations run at ~60 fps.
 - Only audio played through MPD is shown. Bluetooth audio going straight to a
   DAC, or players like Spotify Connect / AirPlay that output to ALSA directly,
   bypass the FIFO.
-- The FIFO is fed ahead of what you hear by the DAC's ALSA buffer (MPD's
-  default: 0.5 s), so the levels are held back by `VIS_DELAY`. Measure the
-  buffer while playing: `grep delay /proc/asound/card*/pcm0p/sub0/status`
-  (frames ÷ rate = seconds). Track titles still change that much early.
+- The FIFO is fed slightly ahead of what you hear because of the DAC's output
+  buffer. In practice the offset is small.
 - Characters other than Latin and Cyrillic show as `?` on the TFT.
 
 ## Project layout
