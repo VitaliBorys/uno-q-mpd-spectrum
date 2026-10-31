@@ -69,7 +69,7 @@ const bool REVERSE = false;
 const unsigned long HOLD_MS = 1000;    // hold this long: next track (fires while held)
 const unsigned long REPEAT_MS = 1000;  // ...and again every this long
 const unsigned long DEBOUNCE_MS = 25;
-const unsigned long FRAME_MS = 33;     // animation: ~30 fps
+const unsigned long FRAME_MS = 16;     // animation: ~60 fps (motion speeds don't depend on it)
 const bool BUTTON_IRQ = true;          // false = poll buttons only
 const bool SHOW_MS = true;             // redraw time in the corner
 const bool SPI16 = true;               // 16-bit SPI words for pixels (when FAST_SPI is off)
@@ -798,12 +798,20 @@ void specStatic() {
   }
 }
 
+// The motion constants below were tuned at 30 fps (one frame = 33 ms). These
+// rescale them to FRAME_MS, so a faster frame rate is smoother, not faster.
+const float FRAME_K = FRAME_MS / 33.0f;
+// Per-frame share of the way to the target (exponential smoothing).
+float easeK(float a) { return 1 - powf(1 - a, FRAME_K); }
+
 void specFrame() {
+  static const float fall = 0.7f * FRAME_K, pkFall = 0.3f * FRAME_K;
+  static const int pkHold = (int)(18 / FRAME_K);                 // ~0.6 s
   for (int b = 0; b < SP_BARS; b++) {
     float target = lv[b] * SP_SEGS;
-    barH[b] = fmaxf(target, barH[b] - 0.7f);
+    barH[b] = fmaxf(target, barH[b] - fall);
     if (barH[b] >= pkH[b]) { pkH[b] = barH[b]; pkAge[b] = 0; }
-    else if (++pkAge[b] > 18) pkH[b] = fmaxf(pkH[b] - 0.3f, 0);
+    else if (++pkAge[b] > pkHold) pkH[b] = fmaxf(pkH[b] - pkFall, 0);
     int h = (int)lroundf(barH[b]), p = (int)lroundf(pkH[b]);
     uint32_t m = h > 0 ? (1UL << h) - 1 : 0;
     if (p > h && p > 0) m |= 1UL << (p - 1);
@@ -869,7 +877,8 @@ void vuFrame() {
   float target[2] = {lvL, lvR};
   for (int i = 0; i < 2; i++) {
     float t = clampf(target[i], 0, 1);
-    vuV[i] += (t - vuV[i]) * (t > vuV[i] ? 0.30f : 0.10f);
+    static const float up = easeK(0.30f), down = easeK(0.10f);
+    vuV[i] += (t - vuV[i]) * (t > vuV[i] ? up : down);
     float a = VU_MIN + vuV[i] * (VU_MAX - VU_MIN);
     if (fabsf(a - vuShown[i]) < 0.8f) continue;
     vuLine(i, vuShown[i], 8, VU_R - 12, PANEL);
@@ -965,7 +974,8 @@ void eyeStatic() {
 
 void eyeFrame() {
   float t = clampf((lvL + lvR) / 2, 0, 1);
-  eyeV += (t - eyeV) * (t > eyeV ? 0.35f : 0.12f);
+  static const float up = easeK(0.35f), down = easeK(0.12f);
+  eyeV += (t - eyeV) * (t > eyeV ? up : down);
   int k = eyeTargetK();
   if (k == shK) return;
   if (k < shK) eyeSector(k, shK, EYE_G);
@@ -984,7 +994,7 @@ void takeLevels() {
 }
 
 // ---- Marquee: a long title swings left to its end and back ---------------
-// Stands 2 s at each end, moves 3 px every 60 ms (~50 px/s). One step
+// Stands 2 s at each end, moves 1 px every 20 ms (~50 px/s). One step
 // redraws just the glyph rows of the title.
 //
 // Drawn in vertical strips, left to right. The panel is a portrait one
@@ -992,8 +1002,8 @@ void takeLevels() {
 // sent row by row (top to bottom) would cross that refresh: the top of the
 // letters already moved, the bottom not yet - a comb through the text.
 // Strips sent along the refresh direction leave at most one vertical seam.
-const unsigned long MQ_HOLD_MS = 2000, MQ_STEP_MS = 60;
-const int MQ_PX = 3;
+const unsigned long MQ_HOLD_MS = 2000, MQ_STEP_MS = 20;
+const int MQ_PX = 1;                     // 1 px every 20 ms: the same ~50 px/s, smoother
 Marquee mq;
 
 void marqueeSetup() {
