@@ -17,6 +17,11 @@ Things found out the hard way on this setup, so they don't get lost.
 
 ## The kernel (7.0, Arduino's build)
 
+- `top` / `vmstat` show ~24 % `wa` (iowait) and `b = 1` all the time while
+  MPD plays, with no disk traffic and nothing in state D. It is MPD's
+  io_uring worker (`iou-wrk-…`, stack `io_wq_worker`) idling: the kernel
+  counts its wait as iowait. One core of four = 25 %. Not load; ignore it.
+
 - Not built in: `sr_mod` / `cdrom` (CD drives), ISO9660 and UDF (data CDs,
   DVDs), NTFS3. Built in: USB storage, SCSI disks, ext4, vfat, exfat.
 - The CD drivers are built out of tree by `tools/cdrom-modules/build.sh`.
