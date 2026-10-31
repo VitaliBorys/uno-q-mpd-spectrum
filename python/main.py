@@ -100,6 +100,10 @@ lo_frame = False
 last_data = 0.0              # time of the last audio received
 rms_lr = np.zeros(2)         # left/right RMS of the latest audio, 0..1
 last_levels = None           # last lv message, to skip repeated silence
+last_sent = 0.0              # when it went out
+# The sketch drops the bars if no lv came for 300 ms. A steady tone gives the
+# same bytes frame after frame: still send them this often.
+LV_REPEAT_S = 0.1
 
 # Bridge.notify is called from several threads (this loop, mpdui): one at a time.
 bridge_lock = threading.Lock()
@@ -189,7 +193,7 @@ def vu_position(rms):
 
 
 def loop():
-    global last_levels, prof_frames, prof_sends
+    global last_levels, last_sent, prof_frames, prof_sends
     start = time.monotonic()
 
     read_audio()
@@ -203,10 +207,13 @@ def loop():
     t_fft = time.monotonic()
 
     lv = (levels * 255).astype(np.uint8).tobytes()
-    if lv != last_levels:                    # silence is sent once, not 25 times a second
+    # Changed levels go out at once; unchanged ones every LV_REPEAT_S, so the
+    # sketch knows they still hold. Silence (all zero) is sent once.
+    if lv != last_levels or (any(lv) and t_fft - last_sent >= LV_REPEAT_S):
         # notify = fire-and-forget: no waiting for the MCU to reply
         send("lv", lv)
         last_levels = lv
+        last_sent = t_fft
         prof_sends += 1
     t_bridge = time.monotonic()
 
