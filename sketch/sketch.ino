@@ -101,6 +101,7 @@ const uint8_t RAIN_MIN[6] = {0, 1, 2, 5, 10, 30};                // minutes, 0 =
 uint8_t setv[S_COUNT] = {9, 1, 0, 1, 6, 4, 0, 0};
 int lastView = -1;                      // from Python, for Start view = Last
 bool cfgSeen = false;                   // the first cfg after boot picks the start view
+unsigned long helloAt = 0;              // last hello sent (repeated until cfg comes)
 // What the settings drive:
 bool menuBarFade = false;               // menu cursor fades instead of sliding
 unsigned long idleMs = 60000;           // no playback this long -> digital rain (0 = never)
@@ -2268,12 +2269,17 @@ void setup() {
   Bridge.provide("page", onPage);
   Bridge.provide("item", onItem);
   Bridge.notify("hello");       // Python answers with the full state
+  helloAt = millis();
   pausedSince = millis();
 }
 
 void loop() {
   handleInput();
   matrixStep();
+  // At start-up the MCU and Python come up in either order, and a hello sent
+  // before Python listens is lost (the settings then stayed at defaults).
+  // Ask again every 2 s until the settings have arrived.
+  if (!cfgSeen && millis() - helloAt > 2000) { Bridge.notify("hello"); helloAt = millis(); }
 
   applyInbox();
 
