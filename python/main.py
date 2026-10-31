@@ -1,10 +1,10 @@
 """
 MPD spectrum analyzer and controller for the Arduino UNO Q.
 
-Reads raw PCM from an MPD FIFO output and runs an FFT. Each frame:
-- the LED matrix gets a 104-byte grayscale frame (13 log-spaced bands);
-- the TFT gets 16 bands plus left/right levels for its spectrum, VU meters
-  and magic eye (the sketch does the drawing and the needle physics).
+Reads raw PCM from an MPD FIFO output and runs an FFT. Each frame one lv
+message (31 bytes) goes to the MCU: 16 bands for the TFT spectrum, the
+left/right VU needle positions, and 13 bands for the LED matrix. The sketch
+does all the drawing and the motion (bars, peaks, needles).
 mpdui.py keeps the TFT's "now playing" screen in sync with MPD and turns
 the knob and buttons into MPD commands.
 """
@@ -23,16 +23,11 @@ FIFO = "/app/viz/mpd.fifo"   # MPD FIFO; the app folder is mounted at /app
 RATE = 44100                 # FIFO format must match mpd.conf: 44100:16:2
 N = 2048                     # FFT window size (~46 ms of audio)
 
-# --- Display ---------------------------------------------------------------
-ROWS, COLS = 8, 13           # UNO Q LED matrix
-FPS = 25                     # frames per second
+# --- Analyzer --------------------------------------------------------------
+COLS = 13                    # LED matrix bands (the matrix is 8 x 13)
+FPS = 25                     # analyses per second
 FLOOR_DB = -48.0             # level shown as an empty bar (closer to 0 = less sensitive)
-
-BAR_FALL = 0.5               # bar fall speed, rows per frame
-PEAK_HOLD = 12               # frames a peak dot stays put (~0.5 s at 25 fps)
-PEAK_FALL = 0.15             # peak dot fall speed, rows per frame
-BAR_BRIGHT = 7               # bar brightness (0..7)
-PEAK_BRIGHT = 4              # peak dot brightness (0..7)
+# Bar fall, peak hold and brightness of the matrix are in sketch.ino (MAT_*).
 
 PROFILE = False              # print per-stage timings to the Python Shell every 5 s
 
@@ -75,14 +70,7 @@ for lo, hi in zip(tft_edges[:-1], tft_edges[1:]):
 tft_maxlen = max(len(b) for b in tft_bands)
 tft_band_idx = np.array([np.pad(b, (0, tft_maxlen - len(b)), mode="edge") for b in tft_bands])
 
-# Row numbers as a column vector, broadcast against per-column heights.
-ROW = np.arange(ROWS)[:, None]
-
-levels = np.zeros(COLS)      # current bar heights (0..ROWS, float)
-peaks = np.zeros(COLS)       # current peak dot heights
-peak_age = np.zeros(COLS)    # frames since each peak was last pushed up
 last_data = 0.0              # time of the last audio received
-last_frame = None            # last frame sent, to skip duplicates
 rms_lr = np.zeros(2)         # left/right RMS of the latest audio, 0..1
 last_levels = None           # last lv message, to skip repeated silence
 
@@ -94,7 +82,7 @@ def send(name, *args):
     with bridge_lock:
         Bridge.notify(name, *args)
 
-prof = {"read": 0.0, "fft": 0.0, "render": 0.0, "bridge": 0.0}
+prof = {"read": 0.0, "fft": 0.0, "bridge": 0.0}
 prof_frames = 0
 prof_sends = 0
 prof_start = time.monotonic()
@@ -146,11 +134,11 @@ def read_audio():
 
 
 def spectrum():
-    """Matrix band heights (0..ROWS) and TFT band levels (0..1)."""
+    """Matrix and TFT band levels, 0..1 (FLOOR_DB..0 dB)."""
     spec = np.abs(np.fft.rfft(buf * window)) / norm
     db = 20 * np.log10(spec[band_idx].max(axis=1) + 1e-9)
     db_tft = 20 * np.log10(spec[tft_band_idx].max(axis=1) + 1e-9)
-    return (np.clip((db - FLOOR_DB) / -FLOOR_DB * ROWS, 0, ROWS),
+    return (np.clip((db - FLOOR_DB) / -FLOOR_DB, 0, 1),
             np.clip((db_tft - FLOOR_DB) / -FLOOR_DB, 0, 1))
 
 
@@ -161,62 +149,32 @@ def vu_position(rms):
     return np.where(vu <= 0, (vu + 20) / 20 * 0.65, 0.65 + vu / 3 * 0.35).clip(0, 1)
 
 
-def render():
-    """Build a 104-byte frame (brightness 0..7), row-major, top row first."""
-    h = np.rint(levels).astype(np.int8)
-    p = np.rint(peaks).astype(np.int8)
-    # Bar: every row from the bottom up to height h.
-    frame = np.where(ROW >= ROWS - h, BAR_BRIGHT, 0)
-    # Peak dot: a single row at height p, only when it is above the bar.
-    frame = np.where((ROW == ROWS - p) & (p > h), PEAK_BRIGHT, frame)
-    return frame.astype(np.uint8).tobytes()
-
-
 def loop():
-    global levels, peaks, peak_age, last_frame, last_levels, prof_frames, prof_sends
+    global last_levels, prof_frames, prof_sends
     start = time.monotonic()
 
     read_audio()
     t_read = time.monotonic()
 
     if t_read - last_data > 0.5:
-        target = np.zeros(COLS)              # silence: let everything fall
-        tft_levels = np.zeros(TFT_BANDS + 2)
+        levels = np.zeros(TFT_BANDS + 2 + COLS)       # silence: everything falls
     else:
-        target, tft = spectrum()
-        tft_levels = np.concatenate((tft, vu_position(rms_lr)))
+        mx, tft = spectrum()
+        levels = np.concatenate((tft, vu_position(rms_lr), mx))
     t_fft = time.monotonic()
 
-    # Bars: jump up instantly, fall smoothly.
-    levels = np.maximum(target, levels - BAR_FALL)
-
-    # Peaks: pushed up by the bar, held for PEAK_HOLD frames, then fall.
-    rising = levels >= peaks
-    peaks = np.where(rising, levels, peaks)
-    peak_age = np.where(rising, 0, peak_age + 1)
-    falling = (~rising) & (peak_age > PEAK_HOLD)
-    peaks = np.where(falling, np.maximum(peaks - PEAK_FALL, 0), peaks)
-
-    frame = render()
-    t_render = time.monotonic()
-
-    if frame != last_frame:
-        # notify = fire-and-forget: no waiting for the MCU to reply (~16 ms saved)
-        send("draw", frame)
-        last_frame = frame
-        prof_sends += 1
-
-    lv = (tft_levels * 255).astype(np.uint8).tobytes()
+    lv = (levels * 255).astype(np.uint8).tobytes()
     if lv != last_levels:                    # silence is sent once, not 25 times a second
+        # notify = fire-and-forget: no waiting for the MCU to reply
         send("lv", lv)
         last_levels = lv
+        prof_sends += 1
     t_bridge = time.monotonic()
 
     if PROFILE:
         prof["read"] += t_read - start
         prof["fft"] += t_fft - t_read
-        prof["render"] += t_render - t_fft
-        prof["bridge"] += t_bridge - t_render
+        prof["bridge"] += t_bridge - t_fft
         prof_frames += 1
         if t_bridge - prof_start >= 5:
             report()

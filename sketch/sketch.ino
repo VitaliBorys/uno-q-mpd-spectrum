@@ -1,6 +1,7 @@
 // MPD controller + spectrum analyzer - MCU side.
 //
-// 1. LED matrix: draws 104-byte frames from Python (the 13-band analyzer).
+// 1. LED matrix: a 13-band analyzer. Python sends the band levels, the
+//    sketch animates the bars and peak dots.
 // 2. 2.4" ST7789 TFT (320x240) + EC11 knob + K0 button: a physical remote
 //    for MPD. Python sends what is playing, the volume, the clock and the
 //    audio levels; the sketch draws the screens and sends the knob and
@@ -22,7 +23,7 @@
 //   After a minute without playback the screen shows the "digital rain".
 //
 // Messages (Router Bridge)
-//   Python -> MCU: draw(frame) trk(...) st(...) lv(levels) clk(minutes)
+//   Python -> MCU: lv(levels) trk(...) st(...) clk(minutes) dev(mask)
 //                  page(list, ctx, start, total) item(list, ctx, index, text)
 //   MCU -> Python: vol(clicks) cmd(code) hello()
 //                  get(list, ctx, start) sel(list, ctx, index, action)
@@ -77,6 +78,13 @@ const bool FAST_SPI = true;            // write SPI2's registers directly, skipp
 const int FAST_SPI_DIV = 4;            // SPI clock = 160 MHz / this: 4 = 40 MHz, 8 = 20 MHz
 const unsigned long IDLE_MS = 60000;   // no playback this long -> digital rain
 const int VOLUME_STEP = 2;             // percent per click (must match Python)
+// LED matrix spectrum (13 bands from Python; the bars are animated here)
+const unsigned long MATRIX_MS = 20;    // matrix updates: 50 a second
+const float MAT_FALL = 12.5f;          // bar fall, rows per second
+const unsigned long MAT_PEAK_HOLD_MS = 500;   // a peak dot stays this long
+const float MAT_PEAK_FALL = 3.75f;     // then falls, rows per second
+const uint8_t MAT_BAR_BRIGHT = 7;      // 0..7
+const uint8_t MAT_PEAK_BRIGHT = 4;
 // -------------------------------------------------------------------------
 
 // ---- Display driver ------------------------------------------------------
@@ -403,6 +411,8 @@ unsigned long volLocalAt = 0;    // last volume change made with the knob
 int clockBase = -1;              // minutes since midnight from Python, -1 = unknown
 unsigned long clockAt = 0;
 unsigned long levelsAt = 0;
+// lv message: 16 TFT bands, VU left, VU right, 13 matrix bands (each 0..255)
+const int LV_BYTES = 31;
 
 // Inbox: written by the Bridge thread, read by loop()
 struct InTrack { char src[8], fmt[16], artist[48], title[72], album[56]; int year, no, of, dur, radio; };
@@ -410,7 +420,7 @@ InTrack inTrack;
 volatile bool inTrackNew = false;
 int inSt[6];
 volatile bool inStNew = false;
-uint8_t inLv[18];
+uint8_t inLv[LV_BYTES];
 volatile bool inLvNew = false;
 volatile int inClk = -1;
 volatile int inDev = -1;
@@ -434,6 +444,11 @@ bool onBlack = false;            // drawing on a cleared area: text boxes only a
 
 // Animation state
 float lv[16], lvL, lvR;
+const int MAT_COLS = 13, MAT_ROWS = 8;
+float matLv[MAT_COLS];               // targets from Python, 0..1
+float matH[MAT_COLS], matPk[MAT_COLS];   // bar and peak heights in rows
+unsigned long matPkAt[MAT_COLS], matAt = 0;
+uint8_t matShown[MAT_COLS * MAT_ROWS];
 float barH[16], pkH[16];
 uint8_t pkAge[16];
 uint32_t segMask[16];
@@ -983,6 +998,34 @@ void eyeFrame() {
   shK = k;
 }
 
+// ---- LED matrix -----------------------------------------------------------
+// 13 bars, bass on the left: jump up at once, fall smoothly; a peak dot holds
+// for a moment, then falls. Driven by time, not by messages, so the bars keep
+// falling evenly when the music stops. Called from loop(); with FAST_SPI the
+// longest TFT redraw is ~50 ms, short enough not to show on the matrix.
+void matrixStep() {
+  unsigned long t = millis();
+  if (t - matAt < MATRIX_MS) return;
+  float dt = fminf((t - matAt) / 1000.0f, 0.1f);
+  matAt = t;
+  bool fresh = t - levelsAt <= 300;            // nothing new for a while: let it fall
+  uint8_t frame[MAT_COLS * MAT_ROWS];
+  for (int b = 0; b < MAT_COLS; b++) {
+    float target = fresh ? matLv[b] * MAT_ROWS : 0;
+    matH[b] = fmaxf(target, matH[b] - MAT_FALL * dt);
+    if (matH[b] >= matPk[b]) { matPk[b] = matH[b]; matPkAt[b] = t; }
+    else if (t - matPkAt[b] > MAT_PEAK_HOLD_MS) matPk[b] = fmaxf(matPk[b] - MAT_PEAK_FALL * dt, 0);
+    int h = (int)lroundf(matH[b]), p = (int)lroundf(matPk[b]);
+    for (int r = 0; r < MAT_ROWS; r++)             // row 0 is the top
+      frame[r * MAT_COLS + b] = r >= MAT_ROWS - h ? MAT_BAR_BRIGHT
+                              : (r == MAT_ROWS - p && p > h) ? MAT_PEAK_BRIGHT : 0;
+  }
+  if (memcmp(frame, matShown, sizeof(frame))) {
+    memcpy(matShown, frame, sizeof(frame));
+    matrix.draw(frame);
+  }
+}
+
 // ---- Audio levels from Python ---------------------------------------------
 // lv message: 16 spectrum bands + left + right, each 0..255. If nothing has
 // arrived for a while (paused, stopped, Python busy), everything falls to 0.
@@ -1308,7 +1351,7 @@ void onSt(int state, int el, int vol, int rpt, int rnd, int song) {
 }
 
 void onLv(std::vector<uint8_t> v) {
-  if (v.size() != sizeof(inLv)) return;
+  if (v.size() != sizeof(inLv)) return;           // an older main.py: ignore
   noInterrupts();
   memcpy(inLv, v.data(), sizeof(inLv));
   inLvNew = true;
@@ -1333,10 +1376,6 @@ void pushItem(int8_t kind, int list, int ctx, int index, int total, const char *
 void onPage(int list, int ctx, int start, int total) { pushItem(0, list, ctx, start, total, ""); }
 void onItem(int list, int ctx, int index, String text) { pushItem(1, list, ctx, index, 0, text.c_str()); }
 
-// The LED matrix has its own driver, it can be drawn right here.
-void draw(std::vector<uint8_t> frame) {
-  if (frame.size() == 104) matrix.draw(frame.data());
-}
 
 // ---- Applying the inbox (loop) ---------------------------------------------
 void applyTrack() {
@@ -1402,6 +1441,7 @@ void applyInbox() {
     for (int b = 0; b < 16; b++) lv[b] = inLv[b] / 255.0f;
     lvL = inLv[16] / 255.0f;
     lvR = inLv[17] / 255.0f;
+    for (int b = 0; b < MAT_COLS; b++) matLv[b] = inLv[18 + b] / 255.0f;
     inLvNew = false;
     interrupts();
     levelsAt = millis();
@@ -1785,7 +1825,6 @@ void setup() {
   drawViewFull();
 
   Bridge.begin();
-  Bridge.provide("draw", draw);
   Bridge.provide("trk", onTrk);
   Bridge.provide("st", onSt);
   Bridge.provide("lv", onLv);
@@ -1799,6 +1838,7 @@ void setup() {
 
 void loop() {
   handleInput();
+  matrixStep();
 
   applyInbox();
 
