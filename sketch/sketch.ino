@@ -72,7 +72,9 @@ const unsigned long DEBOUNCE_MS = 25;
 const unsigned long FRAME_MS = 33;     // animation: ~30 fps
 const bool BUTTON_IRQ = true;          // false = poll buttons only
 const bool SHOW_MS = true;             // redraw time in the corner
-const bool SPI16 = true;               // 16-bit SPI words for pixels (faster)
+const bool SPI16 = true;               // 16-bit SPI words for pixels (when FAST_SPI is off)
+const bool FAST_SPI = true;            // write SPI2's registers directly, skipping Zephyr's driver
+const int FAST_SPI_DIV = 4;            // SPI clock = 160 MHz / this: 4 = 40 MHz, 8 = 20 MHz
 const unsigned long IDLE_MS = 60000;   // no playback this long -> digital rain
 const int VOLUME_STEP = 2;             // percent per click (must match Python)
 // -------------------------------------------------------------------------
@@ -84,6 +86,75 @@ const int VOLUME_STEP = 2;             // percent per click (must match Python)
 //    a fixed time per word, not per bit, so 16-bit words should move pixels
 //    about twice as fast as the library's 8-bit ones. Set SPI16 = false to
 //    compare, or if the screen shows garbage.
+// 3. FAST_SPI: the CPU writes SPI2's data register itself. Zephyr's driver
+//    takes an interrupt per word and sets up every transfer from scratch,
+//    which costs 55-75 % of the time at the same clock (tools/spi-bench:
+//    full screen 494 ms through the library, 138 ms raw at the same 10 MHz,
+//    47 ms raw at 40 MHz). Between startWrite() and endWrite() SPI2 is ours:
+//    transmit-only, our clock, interrupts off; endWrite() gives it back to
+//    Zephyr exactly as it was. Only drawing goes through here, and only
+//    after setup(): the library's own commands (rotation...) use the driver.
+#if defined(ARDUINO_ARCH_ZEPHYR) && !defined(UI_SIM)
+#define HAVE_FAST_SPI 1
+// SPI2 and GPIOB come from ST's CMSIS header for the STM32U585, which the
+// core already includes. TFT DC is D8 = PB4.
+static inline void rawDc(bool high) { GPIOB->BSRR = high ? (1u << 4) : (1u << (4 + 16)); }
+static inline void rawPut8(uint8_t v) {
+  while (!(SPI2->SR & SPI_SR_TXP)) {}
+  *(volatile uint8_t *)&SPI2->TXDR = v;
+}
+static inline void rawPut16(uint16_t v) {
+  while (!(SPI2->SR & SPI_SR_TXP)) {}
+  *(volatile uint16_t *)&SPI2->TXDR = v;
+}
+// Waits until the last bit has left (before DC may change). Bounded, so a
+// surprise in the hardware can't hang the sketch.
+static inline void rawDrain() {
+  for (uint32_t i = 0; i < 100000 && !(SPI2->SR & SPI_SR_TXC); i++) {}
+}
+struct RawSpi {
+  uint32_t cfg1, cfg2, ier;
+  uint8_t bits;
+  void begin() {
+    cfg1 = SPI2->CFG1; cfg2 = SPI2->CFG2; ier = SPI2->IER;
+    SPI2->CR1 &= ~SPI_CR1_SPE;                 // config only changes while off
+    SPI2->IER = 0;                             // keep Zephyr's handler out
+    SPI2->CFG2 = (cfg2 & ~SPI_CFG2_COMM) | SPI_CFG2_COMM_0;   // transmit only
+    SPI2->CR2 = 0;                             // TSIZE 0: no fixed length
+    bits = 0;
+  }
+  // 8-bit words for commands, 16-bit for pixels; switching needs SPE off.
+  void setBits(uint8_t b) {
+    if (b == bits) return;
+    if (bits) { rawDrain(); SPI2->CR1 &= ~SPI_CR1_SPE; }
+    uint32_t mbr = 0;
+    while ((2u << mbr) < (uint32_t)FAST_SPI_DIV && mbr < 7) mbr++;
+    SPI2->CFG1 = (cfg1 & ~(SPI_CFG1_DSIZE | SPI_CFG1_FTHLV | SPI_CFG1_MBR)) |
+                 (uint32_t)(b - 1) | (mbr << SPI_CFG1_MBR_Pos);
+    SPI2->IFCR = 0x0BF8;
+    SPI2->CR1 |= SPI_CR1_SPE;
+    SPI2->CR1 |= SPI_CR1_CSTART;
+    bits = b;
+  }
+  void end() {
+    if (bits) rawDrain();
+    SPI2->CR1 &= ~SPI_CR1_SPE;
+    SPI2->IFCR = 0x0BF8;
+    SPI2->CFG1 = cfg1; SPI2->CFG2 = cfg2; SPI2->IER = ier;   // Zephyr's again
+    bits = 0;
+  }
+};
+#elif defined(UI_SIM)
+// The emulator: same calls, straight into the emulated panel.
+#define HAVE_FAST_SPI 1
+void simRawByte(uint8_t v);
+static inline void rawDc(bool high) { digitalWrite(8, high); }
+static inline void rawPut8(uint8_t v) { simRawByte(v); }
+static inline void rawPut16(uint16_t v) { simRawByte(v >> 8); simRawByte(v & 0xFF); }
+static inline void rawDrain() {}
+struct RawSpi { uint8_t bits; void begin() { bits = 0; } void setBits(uint8_t b) { bits = b; } void end() { bits = 0; } };
+#endif
+
 #if defined(ARDUINO_ARCH_ZEPHYR) && !defined(UI_SIM)
 #define HAVE_SPI16 1
 // Reads the Zephyr device out of the Arduino SPI object (protected member).
@@ -96,6 +167,33 @@ class FastTFT : public DIYables_ST7789_SPI {
 public:
   using DIYables_ST7789_SPI::DIYables_ST7789_SPI;
   bool spi16 = false;
+  bool fast = false;
+
+  // After begin() and setRotation(): from here on drawing bypasses the driver.
+  void beginFast(bool enable) {
+#ifdef HAVE_FAST_SPI
+    fast = enable;
+#endif
+  }
+
+  void startWrite() override {
+#ifdef HAVE_FAST_SPI
+    if (fast) {
+      if (depth++ == 0) { DIYables_ST7789_SPI::startWrite(); raw.begin(); }
+      return;
+    }
+#endif
+    DIYables_ST7789_SPI::startWrite();
+  }
+  void endWrite() override {
+#ifdef HAVE_FAST_SPI
+    if (fast) {
+      if (depth > 0 && --depth == 0) { raw.end(); DIYables_ST7789_SPI::endWrite(); }
+      return;
+    }
+#endif
+    DIYables_ST7789_SPI::endWrite();
+  }
 
   void begin16(bool enable, uint32_t freq) {
 #ifdef HAVE_SPI16
@@ -108,6 +206,16 @@ public:
   }
 
   void window(int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+#ifdef HAVE_FAST_SPI
+    if (fast) {
+      rawCmd(0x2A);
+      rawPut8(x0 >> 8); rawPut8(x0); rawPut8(x1 >> 8); rawPut8(x1);
+      rawCmd(0x2B);
+      rawPut8(y0 >> 8); rawPut8(y0); rawPut8(y1 >> 8); rawPut8(y1);
+      rawCmd(0x2C);                              // DC stays high: pixels follow
+      return;
+    }
+#endif
     uint8_t b[4];
     writeCommand(0x2A);
     b[0] = x0 >> 8; b[1] = x0; b[2] = x1 >> 8; b[3] = x1;
@@ -120,6 +228,13 @@ public:
 
   // Pixels in native RGB565 order. The buffer may be modified.
   void sendPixels(uint16_t *px, size_t n) {
+#ifdef HAVE_FAST_SPI
+    if (fast) {
+      raw.setBits(16);
+      for (size_t i = 0; i < n; i++) rawPut16(px[i]);
+      return;
+    }
+#endif
 #ifdef HAVE_SPI16
     if (spi16) {
       struct spi_buf b = {.buf = px, .len = n * 2};
@@ -161,6 +276,13 @@ public:
 
 protected:
   void fillColor(uint16_t c, uint32_t count) override {
+#ifdef HAVE_FAST_SPI
+    if (fast) {
+      raw.setBits(16);
+      while (count--) rawPut16(c);
+      return;
+    }
+#endif
     static uint16_t buf[1024];
     while (count) {
       uint32_t n = count > 1024 ? 1024 : count;
@@ -171,6 +293,18 @@ protected:
   }
 
 private:
+#ifdef HAVE_FAST_SPI
+  RawSpi raw = {};
+  int depth = 0;                                 // nested startWrite()s
+  void rawCmd(uint8_t c) {
+    raw.setBits(8);
+    rawDrain();                                  // the previous bytes are out
+    rawDc(false);
+    rawPut8(c);
+    rawDrain();
+    rawDc(true);
+  }
+#endif
 #ifdef HAVE_SPI16
   const struct device *dev = nullptr;
   struct spi_config cfg16;
@@ -1675,6 +1809,7 @@ void setup() {
   tft.setBacklight(255);
   tft.begin16(SPI16, 16000000);
   tft.setRotation(1);
+  tft.beginFast(FAST_SPI);       // after the library's own setup commands
   tft.fillScreen(BLACK);
 
   snprintf(now.src, sizeof(now.src), "MPD");
