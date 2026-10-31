@@ -9,6 +9,7 @@ mpdui.py keeps the TFT's "now playing" screen in sync with MPD and turns
 the knob and buttons into MPD commands.
 """
 
+import collections
 import os
 import threading
 import time
@@ -37,6 +38,11 @@ PROFILE = False              # print per-stage timings to the Python Shell every
 TFT_BANDS = 32               # spectrum bars on the TFT, 31 Hz .. 16 kHz
 TFT_LO_HZ = 250              # bars below this come from the N_LO FFT
 VU_REF_DBFS = -18.0          # level that reads 0 VU (a common digital reference)
+# MPD feeds the FIFO as it fills the DAC's ALSA buffer, so we see the audio
+# that long before it is heard. Levels are held back by this much. MPD's
+# default buffer_time is 0.5 s; measure yours while playing:
+# grep delay /proc/asound/card*/pcm0p/sub0/status  (frames / rate = seconds)
+VIS_DELAY = 0.5
 
 # --- Setup -----------------------------------------------------------------
 # Non-blocking read so the loop keeps running while MPD is paused or stopped.
@@ -101,6 +107,7 @@ last_data = 0.0              # time of the last audio received
 rms_lr = np.zeros(2)         # left/right RMS of the latest audio, 0..1
 last_levels = None           # last lv message, to skip repeated silence
 last_sent = 0.0              # when it went out
+delayed = collections.deque()   # (time computed, lv bytes) waiting for VIS_DELAY
 # The sketch drops the bars if no lv came for 300 ms. A steady tone gives the
 # same bytes frame after frame: still send them this often.
 LV_REPEAT_S = 0.1
@@ -206,7 +213,13 @@ def loop():
         levels = np.concatenate((tft, vu_position(rms_lr), mx))
     t_fft = time.monotonic()
 
-    lv = (levels * 255).astype(np.uint8).tobytes()
+    # Into the queue; out comes the newest frame that has waited VIS_DELAY.
+    delayed.append((t_fft, (levels * 255).astype(np.uint8).tobytes()))
+    lv = last_levels
+    while delayed and t_fft - delayed[0][0] >= VIS_DELAY:
+        lv = delayed.popleft()[1]
+    if lv is None:                           # the first VIS_DELAY after start
+        lv = bytes(len(levels))
     # Changed levels go out at once; unchanged ones every LV_REPEAT_S, so the
     # sketch knows they still hold. Silence (all zero) is sent once.
     if lv != last_levels or (any(lv) and t_fft - last_sent >= LV_REPEAT_S):
