@@ -334,7 +334,7 @@ struct Track {
 };
 struct Station { const char *name, *sub, *fmt; };
 struct Album { const char *artist, *name; int16_t year; };
-struct Level { uint8_t id; int ctx; int cursor; int total; char title[40]; };   // total -1 = not known yet
+struct Level { uint8_t id; int ctx; int cursor; int total; char title[40]; int top; };   // total -1 = not known yet; top = first row on screen
 struct InItem { int8_t kind; int list, ctx, index, total; char text[68]; };     // kind 0 page, 1 item
 struct RainCol { int16_t head; uint8_t len, period, phase; };
 struct Marquee { bool on; int x, y, w, h, padY; uint8_t size; int maxOff, off; uint8_t phase; unsigned long at; };
@@ -425,10 +425,19 @@ volatile bool inLvNew = false;
 volatile int inClk = -1;
 volatile int inDev = -1;
 int devMask = DEV_CD | DEV_USB;            // until Python says otherwise
-InItem inQ[16];                  // menu page/item messages, a small ring buffer
+const int INQ = 40;              // a page is 9 messages; a prefetch can add another 9
+InItem inQ[INQ];                 // menu page/item messages, a small ring buffer
 volatile uint8_t inQHead = 0, inQTail = 0;
-char pageText[8][68];            // the 8 rows on screen
-bool pageHave[8];
+// Menu rows received from Python, kept by index (slot = index % ROW_CACHE).
+const int ROW_CACHE = 32;
+char rowText[ROW_CACHE][68];
+int rowIdx[ROW_CACHE];           // which list index a slot holds, -1 = none
+int reqStart[4];                 // pages asked for recently (start index)...
+unsigned long reqAt[4];          // ...and when, so they aren't asked for again
+uint8_t reqNext = 0;
+// Cursor bar sliding between rows: from barFrom to barTo (pixel y), drawn at barY.
+int barY = -1, barFrom = 0, barTo = 0;
+unsigned long barAt = 0, barStepAt = 0;
 Arduino_LED_Matrix matrix;
 int view = V_NOW;
 bool inMenu = false;
@@ -1363,7 +1372,7 @@ void onDev(int mask) { inDev = mask; }
 
 void pushItem(int8_t kind, int list, int ctx, int index, int total, const char *text) {
   noInterrupts();
-  uint8_t next = (inQHead + 1) % 16;
+  uint8_t next = (inQHead + 1) % INQ;
   if (next != inQTail) {                       // full: drop (the page is re-requested on demand)
     InItem &it = inQ[inQHead];
     it.kind = kind; it.list = list; it.ctx = ctx; it.index = index; it.total = total;
@@ -1430,7 +1439,7 @@ void applyInbox() {
     InItem it;
     noInterrupts();
     it = inQ[inQTail];
-    inQTail = (inQTail + 1) % 16;
+    inQTail = (inQTail + 1) % INQ;
     interrupts();
     applyMenuItem(it);
   }
@@ -1467,12 +1476,17 @@ int listCount(const Level &l) {
   return l.total;                              // -1 until Python answers
 }
 
+const char *cachedRow(int idx) {
+  int s = idx % ROW_CACHE;
+  return idx >= 0 && rowIdx[s] == idx ? rowText[s] : nullptr;
+}
+
 void listLabel(const Level &l, int i, char *out, size_t n) {
-  int row = i - i / ROWS * ROWS;
-  if (l.id == L_ROOT) snprintf(out, n, "%s", ROOT_ITEMS[i]);
-  else if (l.total == 0) snprintf(out, n, l.id == L_CD ? "No disc" : "(empty)");
-  else if (l.total < 0 && l.id == L_CD) snprintf(out, n, "Reading disc...");
-  else snprintf(out, n, "%s", pageHave[row] ? pageText[row] : "...");
+  if (l.id == L_ROOT) { snprintf(out, n, "%s", ROOT_ITEMS[i]); return; }
+  if (l.total == 0) { snprintf(out, n, l.id == L_CD ? "No disc" : "(empty)"); return; }
+  if (l.total < 0 && l.id == L_CD) { snprintf(out, n, "Reading disc..."); return; }
+  const char *t = cachedRow(i);
+  snprintf(out, n, "%s", t ? t : "...");
 }
 
 const char *listTitle(const Level &l) {
@@ -1499,8 +1513,13 @@ bool rootAvailable(int i) {
   return true;
 }
 
-// ---- Menu drawing --------------------------------------------------------
-int pageTop(int c) { return c / ROWS * ROWS; }
+// ---- Menu rows: scrolled one at a time, fetched a page ahead ---------------
+// The list scrolls by single rows, keeping one row of context above and
+// below the cursor; press + turn still jumps a page. Rows come from Python
+// a page (8) at a time into a small cache, and the next page is asked for
+// before the cursor gets there. The cursor bar slides between rows.
+const int BAR_STEPS = 4;                       // frames for one slide
+const unsigned long BAR_STEP_MS = 16;
 
 void menuHeader() {
   Level &l = st[depth];
@@ -1513,10 +1532,15 @@ void menuHeader() {
   textR(220, 0, 100, HEAD_H, 3, 6, b, 2, MUTED, BLACK);
 }
 
+int rowY(int i) { return ROW_Y0 + i * ROW_H; }
+int cursorY() { Level &l = st[depth]; return rowY(l.cursor - l.top); }
+
+// Row slot i (0..ROWS-1) of the screen, with the cursor bar wherever barY
+// says (it may cover part of this row while it slides). Drawn in one burst.
 void menuRow(int i) {
   Level &l = st[depth];
-  int idx = pageTop(l.cursor) + i;
-  int y = ROW_Y0 + i * ROW_H;
+  int idx = l.top + i;
+  int y = rowY(i);
   int n = listCount(l);
   if (n <= 0) n = 1;                           // loading ("...") or empty ("(empty)"): one row
   if (idx >= n) {
@@ -1527,18 +1551,35 @@ void menuRow(int i) {
   char b[64];
   listLabel(l, idx, b, sizeof(b));
   bool off = l.id == L_ROOT && !rootAvailable(idx);
-  uint16_t fg = off ? LINE : VFD, bar = off ? MUTED : VFD;
-  if (idx == l.cursor) {
-    tft.fillRect(0, y, 6, ROW_H, BLACK);
-    textBox(6, y, ROW_W - 6, ROW_H - 1, 6, 2, b, 2, BLACK, bar);
-    tft.fillRect(6, y + ROW_H - 1, ROW_W - 6, 1, BLACK);
-    if (opensSubmenu(l) && !off) textBox(ROW_W - 18, y, 12, ROW_H - 1, 0, 2, ">", 2, BLACK, bar);
-    rowW[i] = ROW_W;
-  } else {
-    int w = imin(ROW_W, 12 + u8len(b) * 12);
-    textBox(0, y, imax(w, rowW[i]), ROW_H, 12, 2, b, 2, fg, BLACK);
-    rowW[i] = w;
+  bool curOff = l.id == L_ROOT && !rootAvailable(l.cursor);
+  uint16_t fg = off ? LINE : VFD, bar = curOff ? MUTED : VFD;
+  bool arrow = opensSubmenu(l) && !off && idx == l.cursor && barY == y;
+  const uint8_t *gl[72], *ar[1];
+  int len = imin(decodeGlyphs(b, gl, 72), (ROW_W - 12 - 18) / 12);
+  decodeGlyphs(">", ar, 1);
+  int bTop = barY - y, bBot = bTop + ROW_H - 1;  // the bar, in this row's pixel rows
+  uint16_t *p = pbuf;
+  for (int r = 0; r < ROW_H; r++) {
+    bool inBar = barY >= 0 && r >= bTop && r < bBot;
+    int gy = r - 2;
+    bool inY = gy >= 0 && gy < 16;
+    gy /= 2;
+    for (int c = 0; c < ROW_W; c++) {
+      bool on = false;
+      if (inY) {
+        int gx = c - 12;
+        if (gx >= 0 && gx / 12 < len && (gx / 2) % 6 < 5) on = (gl[gx / 12][(gx / 2) % 6] >> gy) & 1;
+        if (arrow && c >= ROW_W - 18 && c < ROW_W - 8) on = (ar[0][(c - (ROW_W - 18)) / 2] >> gy) & 1;
+      }
+      bool b2 = inBar && c >= 6;
+      *p++ = b2 ? (on ? BLACK : bar) : (on ? fg : BLACK);
+    }
   }
+  tft.startWrite();
+  tft.window(0, y, ROW_W - 1, y + ROW_H - 1);
+  tft.sendPixels(pbuf, (size_t)ROW_W * ROW_H);
+  tft.endWrite();
+  rowW[i] = ROW_W;
 }
 
 void menuScrollbar() {
@@ -1546,14 +1587,18 @@ void menuScrollbar() {
   int n = imax(0, listCount(l)), x = 310, y = ROW_Y0, h = ROWS * ROW_H - 1;
   tft.fillRect(ROW_W, y, 320 - ROW_W, h, BLACK);
   if (n <= ROWS) return;
-  int pages = (n + ROWS - 1) / ROWS;
-  int th = imax(8, h / pages);
-  int ty = y + (long)(h - th) * (pageTop(l.cursor) / ROWS) / (pages - 1);
+  int th = imax(8, h * ROWS / n);
+  int ty = y + (long)(h - th) * l.top / (n - ROWS);
   tft.fillRect(x, y, 3, h, DIM);
   tft.fillRect(x, ty, 3, th, MUTED);
 }
 
-void menuRows();
+void menuRows() {
+  barY = cursorY();                            // a full redraw ends any slide
+  barFrom = barTo = barY;
+  for (int i = 0; i < ROWS; i++) menuRow(i);
+  menuScrollbar();
+}
 
 // dev(mask) arrived: only the root page shows it.
 void menuDevicesChanged() {
@@ -1569,16 +1614,35 @@ void toast(const char *msg) {
   toastUntil = millis() + 1500;
 }
 
-void menuRows() {
-  for (int i = 0; i < ROWS; i++) menuRow(i);
-  menuScrollbar();
+// A new list: forget the rows and requests of the old one.
+void menuForget() {
+  for (int i = 0; i < ROW_CACHE; i++) rowIdx[i] = -1;
+  for (int i = 0; i < 4; i++) reqAt[i] = 0, reqStart[i] = -1;
 }
 
-// Ask Python for the page under the cursor; its rows show "..." until then.
-void requestPage() {
+// Ask Python for the page starting at `start` unless we have it or just asked.
+void requestChunk(int start) {
   Level &l = st[depth];
-  for (int i = 0; i < ROWS; i++) pageHave[i] = false;
-  if (fromPython(l)) Bridge.notify("get", (int)l.id, l.ctx, pageTop(l.cursor));
+  if (!fromPython(l) || start < 0 || (l.total >= 0 && start >= imax(l.total, 1))) return;
+  int end = l.total >= 0 ? imin(start + ROWS, l.total) : start + ROWS;
+  bool missing = false;
+  for (int i = start; i < end && !missing; i++) missing = !cachedRow(i);
+  if (!missing && l.total >= 0) return;
+  for (int k = 0; k < 4; k++)
+    if (reqStart[k] == start && millis() - reqAt[k] < 1500) return;
+  reqStart[reqNext] = start; reqAt[reqNext] = millis(); reqNext = (reqNext + 1) % 4;
+  Bridge.notify("get", (int)l.id, l.ctx, start);
+}
+
+// The pages under the visible rows, plus the next one in the direction of travel.
+void requestVisible(int dir) {
+  Level &l = st[depth];
+  int a = l.top / ROWS * ROWS, b = (l.top + ROWS - 1) / ROWS * ROWS;
+  requestChunk(a);
+  if (b != a) requestChunk(b);
+  if (l.total < 0) return;                     // length unknown yet: no prefetch
+  if (dir > 0) requestChunk(b + ROWS);
+  if (dir < 0) requestChunk(a - ROWS);
 }
 
 void applyMenuItem(const InItem &it) {
@@ -1586,20 +1650,19 @@ void applyMenuItem(const InItem &it) {
   Level &l = st[depth];
   if (it.list != l.id || it.ctx != l.ctx) return;           // an old answer
   if (it.kind == 0) {
-    if (it.index != pageTop(l.cursor)) return;
+    bool changed = it.total != l.total;
     l.total = it.total;
-    if (l.total > 0 && l.cursor >= l.total) {               // the list got shorter
-      l.cursor = l.total - 1;
-      requestPage();
-    }
-    menuHeader();
-    menuRows();
+    if (l.total > 0 && l.cursor >= l.total) l.cursor = l.total - 1;   // the list got shorter
+    int maxTop = imax(0, l.total - ROWS);
+    if (l.top > maxTop) l.top = maxTop;
+    if (l.cursor < l.top) l.top = l.cursor;
+    if (changed) { menuHeader(); menuRows(); requestVisible(0); }
   } else {
-    int row = it.index - pageTop(l.cursor);
-    if (row < 0 || row >= ROWS) return;
-    snprintf(pageText[row], sizeof(pageText[row]), "%s", it.text);
-    pageHave[row] = true;
-    menuRow(row);
+    int s = it.index % ROW_CACHE;
+    snprintf(rowText[s], sizeof(rowText[s]), "%s", it.text);
+    rowIdx[s] = it.index;
+    int row = it.index - l.top;
+    if (row >= 0 && row < ROWS) menuRow(row);
   }
 }
 
@@ -1608,7 +1671,8 @@ void menuEnter() {
   inMenu = true;
   mq.on = false;
   depth = 0;
-  st[0] = {L_ROOT, 0, 0, ROOT_N, ""};
+  st[0] = {L_ROOT, 0, 0, ROOT_N, "", 0};
+  menuForget();
   eraseView(view);
   for (int i = 0; i < ROWS; i++) rowW[i] = 0;       // rows area is black now
   tft.fillRect(276, 204, 44, 24, BLACK);           // volume number
@@ -1627,8 +1691,9 @@ void menuOpen(uint8_t id, int ctx, int cursor) {
   unsigned long t0 = millis();
   clearToast();
   depth++;
-  st[depth] = {id, ctx, cursor, -1, ""};
-  requestPage();
+  st[depth] = {id, ctx, cursor, -1, "", imax(0, cursor - 3)};   // the cursor a bit below the top
+  menuForget();
+  requestVisible(1);
   menuHeader();
   menuRows();
   showMs(millis() - t0);
@@ -1652,10 +1717,34 @@ void menuBack() {
   unsigned long t0 = millis();
   clearToast();
   depth--;
-  requestPage();                               // only one page is kept: fetch it again
+  menuForget();                                // the cache held the deeper list
+  requestVisible(0);
   menuHeader();
   menuRows();
   showMs(millis() - t0);
+}
+
+// Redraws the rows the bar covered at `from` and covers now (at most 3).
+void barRedraw(int from) {
+  int lo = imin(from, barY), hi = imax(from, barY) + ROW_H;
+  for (int i = 0; i < ROWS; i++) {
+    int y = rowY(i);
+    if (y + ROW_H > lo && y < hi) menuRow(i);
+  }
+}
+
+// One frame of the cursor bar's slide; called from loop().
+void menuBarStep() {
+  if (barY == barTo) return;
+  unsigned long t = millis();
+  if (t - barStepAt < BAR_STEP_MS) return;
+  barStepAt = t;
+  int k = imin(BAR_STEPS, (int)((t - barAt) / BAR_STEP_MS) + 1);
+  float f = (float)k / BAR_STEPS;
+  f = 1 - (1 - f) * (1 - f);                   // ease out
+  int from = barY;
+  barY = k >= BAR_STEPS ? barTo : barFrom + (int)lroundf((barTo - barFrom) * f);
+  barRedraw(from);
 }
 
 void menuMove(int d) {
@@ -1664,16 +1753,24 @@ void menuMove(int d) {
   if (n <= 0) return;                          // still loading
   int c = imax(0, imin(n - 1, l.cursor + d));
   if (c == l.cursor) return;
-  int old = l.cursor;
   l.cursor = c;
-  if (pageTop(c) != pageTop(old)) {
+  int top = l.top;                             // keep a row of context above and below
+  if (c < top + 1) top = c - 1;
+  if (c > top + ROWS - 2) top = c - ROWS + 2;
+  top = imax(0, imin(top, imax(0, n - ROWS)));
+  if (top != l.top) {
     unsigned long t0 = millis();
-    requestPage();
-    menuRows();
+    int dir = top > l.top ? 1 : -1;
+    l.top = top;
+    menuRows();                                // ~25 ms with FAST_SPI
+    requestVisible(dir);
     showMs(millis() - t0);
   } else {
-    menuRow(old - pageTop(old));
-    menuRow(c - pageTop(c));
+    barFrom = barY;                            // slide from wherever the bar is now
+    barTo = cursorY();
+    barAt = millis();
+    barStepAt = 0;
+    menuBarStep();
   }
   char b[16];
   snprintf(b, sizeof(b), "%d/%d", c + 1, n);
@@ -1691,10 +1788,10 @@ void menuSelect() {
       break;
     }
     case L_ARTISTS: {
-      int row = i - pageTop(i);
-      if (!pageHave[row]) break;               // not loaded yet
+      const char *t = cachedRow(i);
+      if (!t) break;                           // not loaded yet
       char name[40];
-      snprintf(name, sizeof(name), "%s", pageText[row]);
+      snprintf(name, sizeof(name), "%s", t);
       menuOpen(L_ARTIST_ALBUMS, i, 0);
       snprintf(st[depth].title, sizeof(st[depth].title), "%s", name);
       menuHeader();
@@ -1860,6 +1957,7 @@ void loop() {
   if (!inMenu) marqueeStep();
 
   if (inMenu && toastUntil && t > toastUntil) { toastUntil = 0; menuHint(); }
+  if (inMenu) menuBarStep();
 
   if (!inMenu && view != V_NOW && t - lastFrame >= FRAME_MS) {
     lastFrame = t;
