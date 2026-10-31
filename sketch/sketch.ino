@@ -97,24 +97,26 @@ const int VOLUME_STEP = 2;             // percent per click (must match Python)
 #if defined(ARDUINO_ARCH_ZEPHYR) && !defined(UI_SIM)
 #define HAVE_FAST_SPI 1
 // SPI2 and GPIOB come from ST's CMSIS header for the STM32U585, which the
-// core already includes. TFT DC is D8 = PB4.
-static inline void rawDc(bool high) { GPIOB->BSRR = high ? (1u << 4) : (1u << (4 + 16)); }
-static inline void rawPut8(uint8_t v) {
-  while (!(SPI2->SR & SPI_SR_TXP)) {}
-  *(volatile uint8_t *)&SPI2->TXDR = v;
-}
-static inline void rawPut16(uint16_t v) {
-  while (!(SPI2->SR & SPI_SR_TXP)) {}
-  *(volatile uint16_t *)&SPI2->TXDR = v;
-}
-// Waits until the last bit has left (before DC may change). Bounded, so a
-// surprise in the hardware can't hang the sketch.
-static inline void rawDrain() {
-  for (uint32_t i = 0; i < 100000 && !(SPI2->SR & SPI_SR_TXC); i++) {}
-}
+// core already includes. TFT DC is D8 = PB4. Everything is a member of
+// RawSpi: the Arduino builder puts its function prototypes above the first
+// free function, which must stay below the type declarations.
 struct RawSpi {
   uint32_t cfg1, cfg2, ier;
   uint8_t bits;
+  static void dc(bool high) { GPIOB->BSRR = high ? (1u << 4) : (1u << (4 + 16)); }
+  static void put8(uint8_t v) {
+    while (!(SPI2->SR & SPI_SR_TXP)) {}
+    *(volatile uint8_t *)&SPI2->TXDR = v;
+  }
+  static void put16(uint16_t v) {
+    while (!(SPI2->SR & SPI_SR_TXP)) {}
+    *(volatile uint16_t *)&SPI2->TXDR = v;
+  }
+  // Waits until the last bit has left (before DC may change). Bounded, so a
+  // surprise in the hardware can't hang the sketch.
+  static void drain() {
+    for (uint32_t i = 0; i < 100000 && !(SPI2->SR & SPI_SR_TXC); i++) {}
+  }
   void begin() {
     cfg1 = SPI2->CFG1; cfg2 = SPI2->CFG2; ier = SPI2->IER;
     SPI2->CR1 &= ~SPI_CR1_SPE;                 // config only changes while off
@@ -126,7 +128,7 @@ struct RawSpi {
   // 8-bit words for commands, 16-bit for pixels; switching needs SPE off.
   void setBits(uint8_t b) {
     if (b == bits) return;
-    if (bits) { rawDrain(); SPI2->CR1 &= ~SPI_CR1_SPE; }
+    if (bits) { drain(); SPI2->CR1 &= ~SPI_CR1_SPE; }
     uint32_t mbr = 0;
     while ((2u << mbr) < (uint32_t)FAST_SPI_DIV && mbr < 7) mbr++;
     SPI2->CFG1 = (cfg1 & ~(SPI_CFG1_DSIZE | SPI_CFG1_FTHLV | SPI_CFG1_MBR)) |
@@ -137,7 +139,7 @@ struct RawSpi {
     bits = b;
   }
   void end() {
-    if (bits) rawDrain();
+    if (bits) drain();
     SPI2->CR1 &= ~SPI_CR1_SPE;
     SPI2->IFCR = 0x0BF8;
     SPI2->CFG1 = cfg1; SPI2->CFG2 = cfg2; SPI2->IER = ier;   // Zephyr's again
@@ -147,12 +149,17 @@ struct RawSpi {
 #elif defined(UI_SIM)
 // The emulator: same calls, straight into the emulated panel.
 #define HAVE_FAST_SPI 1
-void simRawByte(uint8_t v);
-static inline void rawDc(bool high) { digitalWrite(8, high); }
-static inline void rawPut8(uint8_t v) { simRawByte(v); }
-static inline void rawPut16(uint16_t v) { simRawByte(v >> 8); simRawByte(v & 0xFF); }
-static inline void rawDrain() {}
-struct RawSpi { uint8_t bits; void begin() { bits = 0; } void setBits(uint8_t b) { bits = b; } void end() { bits = 0; } };
+extern void simRawByte(uint8_t v);
+struct RawSpi {
+  uint8_t bits;
+  static void dc(bool high) { digitalWrite(8, high); }
+  static void put8(uint8_t v) { simRawByte(v); }
+  static void put16(uint16_t v) { simRawByte(v >> 8); simRawByte(v & 0xFF); }
+  static void drain() {}
+  void begin() { bits = 0; }
+  void setBits(uint8_t b) { bits = b; }
+  void end() { bits = 0; }
+};
 #endif
 
 #if defined(ARDUINO_ARCH_ZEPHYR) && !defined(UI_SIM)
@@ -209,9 +216,9 @@ public:
 #ifdef HAVE_FAST_SPI
     if (fast) {
       rawCmd(0x2A);
-      rawPut8(x0 >> 8); rawPut8(x0); rawPut8(x1 >> 8); rawPut8(x1);
+      RawSpi::put8(x0 >> 8); RawSpi::put8(x0); RawSpi::put8(x1 >> 8); RawSpi::put8(x1);
       rawCmd(0x2B);
-      rawPut8(y0 >> 8); rawPut8(y0); rawPut8(y1 >> 8); rawPut8(y1);
+      RawSpi::put8(y0 >> 8); RawSpi::put8(y0); RawSpi::put8(y1 >> 8); RawSpi::put8(y1);
       rawCmd(0x2C);                              // DC stays high: pixels follow
       return;
     }
@@ -231,7 +238,7 @@ public:
 #ifdef HAVE_FAST_SPI
     if (fast) {
       raw.setBits(16);
-      for (size_t i = 0; i < n; i++) rawPut16(px[i]);
+      for (size_t i = 0; i < n; i++) RawSpi::put16(px[i]);
       return;
     }
 #endif
@@ -279,7 +286,7 @@ protected:
 #ifdef HAVE_FAST_SPI
     if (fast) {
       raw.setBits(16);
-      while (count--) rawPut16(c);
+      while (count--) RawSpi::put16(c);
       return;
     }
 #endif
@@ -298,11 +305,11 @@ private:
   int depth = 0;                                 // nested startWrite()s
   void rawCmd(uint8_t c) {
     raw.setBits(8);
-    rawDrain();                                  // the previous bytes are out
-    rawDc(false);
-    rawPut8(c);
-    rawDrain();
-    rawDc(true);
+    RawSpi::drain();                                  // the previous bytes are out
+    RawSpi::dc(false);
+    RawSpi::put8(c);
+    RawSpi::drain();
+    RawSpi::dc(true);
   }
 #endif
 #ifdef HAVE_SPI16
