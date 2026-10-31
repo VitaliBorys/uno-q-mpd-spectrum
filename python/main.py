@@ -1,10 +1,10 @@
 """
 MPD spectrum analyzer and controller for the Arduino UNO Q.
 
-Reads raw PCM from an MPD FIFO output and runs an FFT. Each frame:
-- the LED matrix gets a 104-byte grayscale frame (13 log-spaced bands);
-- the TFT gets 16 bands plus left/right levels for its spectrum, VU meters
-  and magic eye (the sketch does the drawing and the needle physics).
+Reads raw PCM from an MPD FIFO output and runs an FFT. Each frame one lv
+message (31 bytes) goes to the MCU: 16 bands for the TFT spectrum, the
+left/right VU needle positions, and 13 bands for the LED matrix. The sketch
+does all the drawing and the motion (bars, peaks, needles).
 mpdui.py keeps the TFT's "now playing" screen in sync with MPD and turns
 the knob and buttons into MPD commands.
 """
@@ -22,31 +22,31 @@ from mpdui import Controller
 FIFO = "/app/viz/mpd.fifo"   # MPD FIFO; the app folder is mounted at /app
 RATE = 44100                 # FIFO format must match mpd.conf: 44100:16:2
 N = 2048                     # FFT window size (~46 ms of audio)
+N_LO = 4096                  # a longer FFT (~93 ms) for the TFT's bass bands
 
-# --- Display ---------------------------------------------------------------
-ROWS, COLS = 8, 13           # UNO Q LED matrix
-FPS = 25                     # frames per second
-FLOOR_DB = -48.0             # level shown as an empty bar (closer to 0 = less sensitive)
-
-BAR_FALL = 0.5               # bar fall speed, rows per frame
-PEAK_HOLD = 12               # frames a peak dot stays put (~0.5 s at 25 fps)
-PEAK_FALL = 0.15             # peak dot fall speed, rows per frame
-BAR_BRIGHT = 7               # bar brightness (0..7)
-PEAK_BRIGHT = 4              # peak dot brightness (0..7)
+# --- Analyzer --------------------------------------------------------------
+COLS = 13                    # LED matrix bands (the matrix is 8 x 13)
+FPS = 25                     # analyses per second
+# Sensitivity (the level shown as an empty bar) is in the Settings menu:
+# -36 .. -60 dB, closer to 0 = less sensitive. Stored in settings.json.
+# Bar fall, peak hold and brightness of the matrix are in sketch.ino (MAT_*).
 
 PROFILE = False              # print per-stage timings to the Python Shell every 5 s
 
 # --- TFT -------------------------------------------------------------------
-TFT_BANDS = 16               # spectrum bars on the TFT, 31 Hz .. 16 kHz
+TFT_BANDS = 32               # spectrum bars on the TFT, 31 Hz .. 16 kHz
+TFT_LO_HZ = 250              # bars below this come from the N_LO FFT
 VU_REF_DBFS = -18.0          # level that reads 0 VU (a common digital reference)
 
 # --- Setup -----------------------------------------------------------------
 # Non-blocking read so the loop keeps running while MPD is paused or stopped.
 fd = os.open(FIFO, os.O_RDONLY | os.O_NONBLOCK)
 pending = b""
-buf = np.zeros(N, dtype=np.float32)
+buf = np.zeros(N_LO, dtype=np.float32)       # the newest N_LO mono samples
 window = np.hanning(N).astype(np.float32)
 norm = window.sum() / 2      # scale so a full-scale sine reads 0 dB
+window_lo = np.hanning(N_LO).astype(np.float32)
+norm_lo = window_lo.sum() / 2
 
 # 13 log-spaced bands from 40 Hz to 16 kHz.
 edges = np.geomspace(40, 16000, COLS + 1)
@@ -64,25 +64,21 @@ for lo, hi in zip(edges[:-1], edges[1:]):
 maxlen = max(len(b) for b in bands)
 band_idx = np.array([np.pad(b, (0, maxlen - len(b)), mode="edge") for b in bands])
 
-# Same thing for the TFT's 16 bands.
+# The TFT's 32 bands. At 31 Hz a band is ~7 Hz wide, narrower than one bin
+# of the 2048-point FFT (21.5 Hz): several bars would show the same bin. So
+# the bass bars use a 4096-point FFT (10.8 Hz bins), and a band still
+# narrower than a bin reads the spectrum at its centre, interpolated
+# between the two nearest bins, so neighbouring bars differ smoothly.
+freqs_lo = np.fft.rfftfreq(N_LO, 1 / RATE)
 tft_edges = np.geomspace(31, 16000, TFT_BANDS + 1)
-tft_bands = []
+tft_plan = []                # per band: (use the N_LO FFT, bin indexes or None, centre Hz)
 for lo, hi in zip(tft_edges[:-1], tft_edges[1:]):
-    idx = np.where((freqs >= lo) & (freqs < hi))[0]
-    if len(idx) == 0:
-        idx = np.array([np.argmin(np.abs(freqs - (lo + hi) / 2))])
-    tft_bands.append(idx)
-tft_maxlen = max(len(b) for b in tft_bands)
-tft_band_idx = np.array([np.pad(b, (0, tft_maxlen - len(b)), mode="edge") for b in tft_bands])
+    use_lo = np.sqrt(lo * hi) < TFT_LO_HZ
+    f = freqs_lo if use_lo else freqs
+    idx = np.where((f >= lo) & (f < hi))[0]
+    tft_plan.append((use_lo, idx if len(idx) >= 2 else None, np.sqrt(lo * hi)))
 
-# Row numbers as a column vector, broadcast against per-column heights.
-ROW = np.arange(ROWS)[:, None]
-
-levels = np.zeros(COLS)      # current bar heights (0..ROWS, float)
-peaks = np.zeros(COLS)       # current peak dot heights
-peak_age = np.zeros(COLS)    # frames since each peak was last pushed up
 last_data = 0.0              # time of the last audio received
-last_frame = None            # last frame sent, to skip duplicates
 rms_lr = np.zeros(2)         # left/right RMS of the latest audio, 0..1
 last_levels = None           # last lv message, to skip repeated silence
 
@@ -94,7 +90,7 @@ def send(name, *args):
     with bridge_lock:
         Bridge.notify(name, *args)
 
-prof = {"read": 0.0, "fft": 0.0, "render": 0.0, "bridge": 0.0}
+prof = {"read": 0.0, "fft": 0.0, "bridge": 0.0}
 prof_frames = 0
 prof_sends = 0
 prof_start = time.monotonic()
@@ -127,7 +123,7 @@ def read_audio():
             break
         pending += chunk
 
-    pending = pending[-N * 4 * 2:]           # only the freshest audio matters
+    pending = pending[-N_LO * 4 * 2:]        # only the freshest audio matters
     usable = len(pending) - len(pending) % 4  # whole stereo 16-bit frames only
     if usable == 0:
         return
@@ -138,20 +134,26 @@ def read_audio():
     recent = data[-N * 2:] / 32768.0            # last ~46 ms, interleaved L R
     rms_lr = np.sqrt(np.mean(recent.reshape(-1, 2) ** 2, axis=0))
 
-    if len(mono) >= N:
-        buf = mono[-N:]
+    if len(mono) >= N_LO:
+        buf = mono[-N_LO:]
     else:
         buf = np.concatenate((buf[len(mono):], mono))
     last_data = time.monotonic()
 
 
 def spectrum():
-    """Matrix band heights (0..ROWS) and TFT band levels (0..1)."""
-    spec = np.abs(np.fft.rfft(buf * window)) / norm
+    """Matrix and TFT band levels, 0..1 (the sensitivity setting .. 0 dB)."""
+    floor = controller.floor_db()
+    spec = np.abs(np.fft.rfft(buf[-N:] * window)) / norm
+    spec_lo = np.abs(np.fft.rfft(buf * window_lo)) / norm_lo
     db = 20 * np.log10(spec[band_idx].max(axis=1) + 1e-9)
-    db_tft = 20 * np.log10(spec[tft_band_idx].max(axis=1) + 1e-9)
-    return (np.clip((db - FLOOR_DB) / -FLOOR_DB * ROWS, 0, ROWS),
-            np.clip((db_tft - FLOOR_DB) / -FLOOR_DB, 0, 1))
+    tft = np.empty(TFT_BANDS)
+    for b, (use_lo, idx, centre) in enumerate(tft_plan):
+        sp, f = (spec_lo, freqs_lo) if use_lo else (spec, freqs)
+        tft[b] = sp[idx].max() if idx is not None else np.interp(centre, f, sp)
+    db_tft = 20 * np.log10(tft + 1e-9)
+    return (np.clip((db - floor) / -floor, 0, 1),
+            np.clip((db_tft - floor) / -floor, 0, 1))
 
 
 def vu_position(rms):
@@ -161,62 +163,32 @@ def vu_position(rms):
     return np.where(vu <= 0, (vu + 20) / 20 * 0.65, 0.65 + vu / 3 * 0.35).clip(0, 1)
 
 
-def render():
-    """Build a 104-byte frame (brightness 0..7), row-major, top row first."""
-    h = np.rint(levels).astype(np.int8)
-    p = np.rint(peaks).astype(np.int8)
-    # Bar: every row from the bottom up to height h.
-    frame = np.where(ROW >= ROWS - h, BAR_BRIGHT, 0)
-    # Peak dot: a single row at height p, only when it is above the bar.
-    frame = np.where((ROW == ROWS - p) & (p > h), PEAK_BRIGHT, frame)
-    return frame.astype(np.uint8).tobytes()
-
-
 def loop():
-    global levels, peaks, peak_age, last_frame, last_levels, prof_frames, prof_sends
+    global last_levels, prof_frames, prof_sends
     start = time.monotonic()
 
     read_audio()
     t_read = time.monotonic()
 
     if t_read - last_data > 0.5:
-        target = np.zeros(COLS)              # silence: let everything fall
-        tft_levels = np.zeros(TFT_BANDS + 2)
+        levels = np.zeros(TFT_BANDS + 2 + COLS)       # silence: everything falls
     else:
-        target, tft = spectrum()
-        tft_levels = np.concatenate((tft, vu_position(rms_lr)))
+        mx, tft = spectrum()
+        levels = np.concatenate((tft, vu_position(rms_lr), mx))
     t_fft = time.monotonic()
 
-    # Bars: jump up instantly, fall smoothly.
-    levels = np.maximum(target, levels - BAR_FALL)
-
-    # Peaks: pushed up by the bar, held for PEAK_HOLD frames, then fall.
-    rising = levels >= peaks
-    peaks = np.where(rising, levels, peaks)
-    peak_age = np.where(rising, 0, peak_age + 1)
-    falling = (~rising) & (peak_age > PEAK_HOLD)
-    peaks = np.where(falling, np.maximum(peaks - PEAK_FALL, 0), peaks)
-
-    frame = render()
-    t_render = time.monotonic()
-
-    if frame != last_frame:
-        # notify = fire-and-forget: no waiting for the MCU to reply (~16 ms saved)
-        send("draw", frame)
-        last_frame = frame
-        prof_sends += 1
-
-    lv = (tft_levels * 255).astype(np.uint8).tobytes()
+    lv = (levels * 255).astype(np.uint8).tobytes()
     if lv != last_levels:                    # silence is sent once, not 25 times a second
+        # notify = fire-and-forget: no waiting for the MCU to reply
         send("lv", lv)
         last_levels = lv
+        prof_sends += 1
     t_bridge = time.monotonic()
 
     if PROFILE:
         prof["read"] += t_read - start
         prof["fft"] += t_fft - t_read
-        prof["render"] += t_render - t_fft
-        prof["bridge"] += t_bridge - t_render
+        prof["bridge"] += t_bridge - t_fft
         prof_frames += 1
         if t_bridge - prof_start >= 5:
             report()
@@ -231,5 +203,6 @@ Bridge.provide("cmd", controller.on_cmd)
 Bridge.provide("hello", controller.on_hello)
 Bridge.provide("get", controller.on_get)
 Bridge.provide("sel", controller.on_sel)
+Bridge.provide("set", controller.on_set)
 
 App.run(user_loop=loop)

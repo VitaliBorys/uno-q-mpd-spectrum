@@ -1,0 +1,6 @@
+# SPI speed test for the TFT: Zephyr's SPI driver vs. writing the SPI
+# registers directly. Copy this folder to ~/ArduinoApps/spi-bench and Run it.
+name: spi-bench
+icon: ⏱️
+ports: []
+bricks: []

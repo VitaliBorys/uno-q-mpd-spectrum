@@ -1,6 +1,7 @@
 // MPD controller + spectrum analyzer - MCU side.
 //
-// 1. LED matrix: draws 104-byte frames from Python (the 13-band analyzer).
+// 1. LED matrix: a 13-band analyzer. Python sends the band levels, the
+//    sketch animates the bars and peak dots.
 // 2. 2.4" ST7789 TFT (320x240) + EC11 knob + K0 button: a physical remote
 //    for MPD. Python sends what is playing, the volume, the clock and the
 //    audio levels; the sketch draws the screens and sends the knob and
@@ -22,7 +23,7 @@
 //   After a minute without playback the screen shows the "digital rain".
 //
 // Messages (Router Bridge)
-//   Python -> MCU: draw(frame) trk(...) st(...) lv(levels) clk(minutes)
+//   Python -> MCU: lv(levels) trk(...) st(...) clk(minutes) dev(mask)
 //                  page(list, ctx, start, total) item(list, ctx, index, text)
 //   MCU -> Python: vol(clicks) cmd(code) hello()
 //                  get(list, ctx, start) sel(list, ctx, index, action)
@@ -69,13 +70,42 @@ const bool REVERSE = false;
 const unsigned long HOLD_MS = 1000;    // hold this long: next track (fires while held)
 const unsigned long REPEAT_MS = 1000;  // ...and again every this long
 const unsigned long DEBOUNCE_MS = 25;
-const unsigned long FRAME_MS = 33;     // animation: ~30 fps
+const unsigned long FRAME_MS = 16;     // animation: ~60 fps (motion speeds don't depend on it)
 const bool BUTTON_IRQ = true;          // false = poll buttons only
 const bool SHOW_MS = true;             // redraw time in the corner
-const bool SPI16 = true;               // 16-bit SPI words for pixels (faster)
-const unsigned long IDLE_MS = 60000;   // no playback this long -> digital rain
+const bool SPI16 = true;               // 16-bit SPI words for pixels (when FAST_SPI is off)
+const bool FAST_SPI = true;            // write SPI2's registers directly, skipping Zephyr's driver
+const int FAST_SPI_DIV = 4;            // SPI clock = 160 MHz / this: 4 = 40 MHz, 8 = 20 MHz
+const bool STRIPS_RTL = true;          // strips right to left: the panel's refresh direction (tested)
+// Panel refresh (ST7789 FRCTRL2): 0x0F = 60 Hz, the default. 0x00 (119 Hz)
+// left this panel black with two stripes; 0x0F is not even sent.
+const uint8_t PANEL_FRCTRL2 = 0x0F;
 const int VOLUME_STEP = 2;             // percent per click (must match Python)
+// LED matrix spectrum (13 bands from Python; the bars are animated here)
+const unsigned long MATRIX_MS = 20;    // matrix updates: 50 a second
+const float MAT_FALL = 12.5f;          // bar fall, rows per second
+const unsigned long MAT_PEAK_HOLD_MS = 500;   // a peak dot stays this long
+const float MAT_PEAK_FALL = 3.75f;     // then falls, rows per second
 // -------------------------------------------------------------------------
+
+// ---- Settings: the Settings menu; Python keeps them in settings.json -------
+// Each setting is an index into its list of values. Python sends them all
+// with cfg(bytes) (on hello), the menu sends a change back with set(key, i).
+enum { S_BRIGHT, S_SPEC, S_PEAKS, S_RAIN, S_MATBRI, S_SENS, S_START, S_CURSOR, S_COUNT };
+const int S_LAST_VIEW = 100;           // not a menu row: the view to come back to
+const char *const S_NAMES[S_COUNT] = {
+  "Brightness", "Spectrum", "Peaks", "Rain after", "Matrix", "Sensitivity", "Start view", "Menu cursor"};
+const uint8_t S_N[S_COUNT] = {10, 2, 2, 6, 7, 9, 5, 2};          // how many values each has
+const uint8_t S_DEFAULT[S_COUNT] = {9, 1, 0, 1, 6, 4, 0, 0};     // 100 %, 32 bars, fade, 1 min, 7, -48 dB, Now, slide
+const uint8_t RAIN_MIN[6] = {0, 1, 2, 5, 10, 30};                // minutes, 0 = never
+uint8_t setv[S_COUNT] = {9, 1, 0, 1, 6, 4, 0, 0};
+int lastView = -1;                      // from Python, for Start view = Last
+bool cfgSeen = false;                   // the first cfg after boot picks the start view
+// What the settings drive:
+bool menuBarFade = false;               // menu cursor fades instead of sliding
+unsigned long idleMs = 60000;           // no playback this long -> digital rain (0 = never)
+uint8_t matBarB = 7, matPeakB = 4;      // LED matrix brightness, 0..7
+bool spFall = false;                    // spectrum peaks fall instead of fading
 
 // ---- Display driver ------------------------------------------------------
 // Two speed-ups over the library:
@@ -84,6 +114,82 @@ const int VOLUME_STEP = 2;             // percent per click (must match Python)
 //    a fixed time per word, not per bit, so 16-bit words should move pixels
 //    about twice as fast as the library's 8-bit ones. Set SPI16 = false to
 //    compare, or if the screen shows garbage.
+// 3. FAST_SPI: the CPU writes SPI2's data register itself. Zephyr's driver
+//    takes an interrupt per word and sets up every transfer from scratch,
+//    which costs 55-75 % of the time at the same clock (tools/spi-bench:
+//    full screen 494 ms through the library, 138 ms raw at the same 10 MHz,
+//    47 ms raw at 40 MHz). Between startWrite() and endWrite() SPI2 is ours:
+//    transmit-only, our clock, interrupts off; endWrite() gives it back to
+//    Zephyr exactly as it was. Only drawing goes through here, and only
+//    after setup(): the library's own commands (rotation...) use the driver.
+#if defined(ARDUINO_ARCH_ZEPHYR) && !defined(UI_SIM)
+#define HAVE_FAST_SPI 1
+// SPI2 and GPIOB come from ST's CMSIS header for the STM32U585, which the
+// core already includes. TFT DC is D8 = PB4. Everything is a member of
+// RawSpi: the Arduino builder puts its function prototypes above the first
+// free function, which must stay below the type declarations.
+struct RawSpi {
+  uint32_t cfg1, cfg2, ier;
+  uint8_t bits;
+  static void dc(bool high) { GPIOB->BSRR = high ? (1u << 4) : (1u << (4 + 16)); }
+  static void put8(uint8_t v) {
+    while (!(SPI2->SR & SPI_SR_TXP)) {}
+    *(volatile uint8_t *)&SPI2->TXDR = v;
+  }
+  static void put16(uint16_t v) {
+    while (!(SPI2->SR & SPI_SR_TXP)) {}
+    *(volatile uint16_t *)&SPI2->TXDR = v;
+  }
+  // Waits until the last bit has left (before DC may change). Bounded, so a
+  // surprise in the hardware can't hang the sketch.
+  static void drain() {
+    for (uint32_t i = 0; i < 100000 && !(SPI2->SR & SPI_SR_TXC); i++) {}
+  }
+  void begin() {
+    cfg1 = SPI2->CFG1; cfg2 = SPI2->CFG2; ier = SPI2->IER;
+    SPI2->CR1 &= ~SPI_CR1_SPE;                 // config only changes while off
+    SPI2->IER = 0;                             // keep Zephyr's handler out
+    SPI2->CFG2 = (cfg2 & ~SPI_CFG2_COMM) | SPI_CFG2_COMM_0;   // transmit only
+    SPI2->CR2 = 0;                             // TSIZE 0: no fixed length
+    bits = 0;
+  }
+  // 8-bit words for commands, 16-bit for pixels; switching needs SPE off.
+  void setBits(uint8_t b) {
+    if (b == bits) return;
+    if (bits) { drain(); SPI2->CR1 &= ~SPI_CR1_SPE; }
+    uint32_t mbr = 0;
+    while ((2u << mbr) < (uint32_t)FAST_SPI_DIV && mbr < 7) mbr++;
+    SPI2->CFG1 = (cfg1 & ~(SPI_CFG1_DSIZE | SPI_CFG1_FTHLV | SPI_CFG1_MBR)) |
+                 (uint32_t)(b - 1) | (mbr << SPI_CFG1_MBR_Pos);
+    SPI2->IFCR = 0x0BF8;
+    SPI2->CR1 |= SPI_CR1_SPE;
+    SPI2->CR1 |= SPI_CR1_CSTART;
+    bits = b;
+  }
+  void end() {
+    if (bits) drain();
+    SPI2->CR1 &= ~SPI_CR1_SPE;
+    SPI2->IFCR = 0x0BF8;
+    SPI2->CFG1 = cfg1; SPI2->CFG2 = cfg2; SPI2->IER = ier;   // Zephyr's again
+    bits = 0;
+  }
+};
+#elif defined(UI_SIM)
+// The emulator: same calls, straight into the emulated panel.
+#define HAVE_FAST_SPI 1
+extern void simRawByte(uint8_t v);
+struct RawSpi {
+  uint8_t bits;
+  static void dc(bool high) { digitalWrite(8, high); }
+  static void put8(uint8_t v) { simRawByte(v); }
+  static void put16(uint16_t v) { simRawByte(v >> 8); simRawByte(v & 0xFF); }
+  static void drain() {}
+  void begin() { bits = 0; }
+  void setBits(uint8_t b) { bits = b; }
+  void end() { bits = 0; }
+};
+#endif
+
 #if defined(ARDUINO_ARCH_ZEPHYR) && !defined(UI_SIM)
 #define HAVE_SPI16 1
 // Reads the Zephyr device out of the Arduino SPI object (protected member).
@@ -96,6 +202,37 @@ class FastTFT : public DIYables_ST7789_SPI {
 public:
   using DIYables_ST7789_SPI::DIYables_ST7789_SPI;
   bool spi16 = false;
+  bool fast = false;
+
+  void frameRate(uint8_t frctrl2) {             // through the driver, before beginFast()
+    startWrite(); writeCommand(0xC6); writeData8(frctrl2); endWrite();
+  }
+
+  // After begin() and setRotation(): from here on drawing bypasses the driver.
+  void beginFast(bool enable) {
+#ifdef HAVE_FAST_SPI
+    fast = enable;
+#endif
+  }
+
+  void startWrite() override {
+#ifdef HAVE_FAST_SPI
+    if (fast) {
+      if (depth++ == 0) { DIYables_ST7789_SPI::startWrite(); raw.begin(); }
+      return;
+    }
+#endif
+    DIYables_ST7789_SPI::startWrite();
+  }
+  void endWrite() override {
+#ifdef HAVE_FAST_SPI
+    if (fast) {
+      if (depth > 0 && --depth == 0) { raw.end(); DIYables_ST7789_SPI::endWrite(); }
+      return;
+    }
+#endif
+    DIYables_ST7789_SPI::endWrite();
+  }
 
   void begin16(bool enable, uint32_t freq) {
 #ifdef HAVE_SPI16
@@ -108,6 +245,16 @@ public:
   }
 
   void window(int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+#ifdef HAVE_FAST_SPI
+    if (fast) {
+      rawCmd(0x2A);
+      RawSpi::put8(x0 >> 8); RawSpi::put8(x0); RawSpi::put8(x1 >> 8); RawSpi::put8(x1);
+      rawCmd(0x2B);
+      RawSpi::put8(y0 >> 8); RawSpi::put8(y0); RawSpi::put8(y1 >> 8); RawSpi::put8(y1);
+      rawCmd(0x2C);                              // DC stays high: pixels follow
+      return;
+    }
+#endif
     uint8_t b[4];
     writeCommand(0x2A);
     b[0] = x0 >> 8; b[1] = x0; b[2] = x1 >> 8; b[3] = x1;
@@ -120,6 +267,13 @@ public:
 
   // Pixels in native RGB565 order. The buffer may be modified.
   void sendPixels(uint16_t *px, size_t n) {
+#ifdef HAVE_FAST_SPI
+    if (fast) {
+      raw.setBits(16);
+      for (size_t i = 0; i < n; i++) RawSpi::put16(px[i]);
+      return;
+    }
+#endif
 #ifdef HAVE_SPI16
     if (spi16) {
       struct spi_buf b = {.buf = px, .len = n * 2};
@@ -161,6 +315,13 @@ public:
 
 protected:
   void fillColor(uint16_t c, uint32_t count) override {
+#ifdef HAVE_FAST_SPI
+    if (fast) {
+      raw.setBits(16);
+      while (count--) RawSpi::put16(c);
+      return;
+    }
+#endif
     static uint16_t buf[1024];
     while (count) {
       uint32_t n = count > 1024 ? 1024 : count;
@@ -171,6 +332,18 @@ protected:
   }
 
 private:
+#ifdef HAVE_FAST_SPI
+  RawSpi raw = {};
+  int depth = 0;                                 // nested startWrite()s
+  void rawCmd(uint8_t c) {
+    raw.setBits(8);
+    RawSpi::drain();                                  // the previous bytes are out
+    RawSpi::dc(false);
+    RawSpi::put8(c);
+    RawSpi::drain();
+    RawSpi::dc(true);
+  }
+#endif
 #ifdef HAVE_SPI16
   const struct device *dev = nullptr;
   struct spi_config cfg16;
@@ -185,7 +358,7 @@ struct Track {
 };
 struct Station { const char *name, *sub, *fmt; };
 struct Album { const char *artist, *name; int16_t year; };
-struct Level { uint8_t id; int ctx; int cursor; int total; char title[40]; };   // total -1 = not known yet
+struct Level { uint8_t id; int ctx; int cursor; int total; char title[40]; int top; };   // total -1 = not known yet; top = first row on screen
 struct InItem { int8_t kind; int list, ctx, index, total; char text[68]; };     // kind 0 page, 1 item
 struct RainCol { int16_t head; uint8_t len, period, phase; };
 struct Marquee { bool on; int x, y, w, h, padY; uint8_t size; int maxOff, off; uint8_t phase; unsigned long at; };
@@ -195,14 +368,14 @@ struct NowInfo {
   bool radio;
 };
 
-enum { L_ROOT, L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD, L_USB };
+enum { L_ROOT, L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD, L_USB, L_SETTINGS };
 enum { V_NOW, V_SPECTRUM, V_VU, V_EYE };
 
 // ---- Menu ----------------------------------------------------------------
 // List ids, shared with Python: 1 queue, 2 artists, 3 an artist's albums,
 // 4 albums, 5 radio, 6 CD. The top level (0) is drawn by the sketch itself.
-const char *const ROOT_ITEMS[] = {"Queue", "Artists", "Albums", "Radio", "CD", "USB"};
-const uint8_t ROOT_LISTS[] = {L_QUEUE, L_ARTISTS, L_ALBUMS, L_RADIO, L_CD, L_USB};
+const char *const ROOT_ITEMS[] = {"Queue", "Artists", "Albums", "Radio", "CD", "USB", "Settings"};
+const uint8_t ROOT_LISTS[] = {L_QUEUE, L_ARTISTS, L_ALBUMS, L_RADIO, L_CD, L_USB, L_SETTINGS};
 const int ROOT_N = sizeof(ROOT_LISTS) / sizeof(ROOT_LISTS[0]);
 // Devices Python reports with dev(mask); a root item whose device is missing
 // is drawn dim and only shows a hint.
@@ -231,10 +404,13 @@ const uint16_t EYE_G = RGB(150, 255, 30);
 const uint16_t EYE_D = RGB(22, 34, 6);
 const uint16_t EYE_RIM = RGB(30, 44, 10);
 const uint16_t EYE_HUB = RGB(10, 14, 4);
-const uint16_t MX_HEAD = RGB(190, 255, 210);
-const uint16_t MX_MID = RGB(0, 150, 70);
-const uint16_t MX_DARK = RGB(0, 70, 32);
-const uint16_t MX_CLOCK = RGB(150, 255, 190);
+// Rain shades: 0 empty, 1..7 the trail from dark to bright, 8 the head.
+const uint16_t MX_SHADE[9] = {
+  RGB(0, 0, 0), RGB(0, 40, 18), RGB(0, 62, 28), RGB(0, 88, 40), RGB(0, 118, 55),
+  RGB(0, 152, 72), RGB(0, 195, 92), RGB(0, 255, 120), RGB(190, 255, 210),
+};
+const uint8_t MX_HEAD = 8;
+const unsigned long RAIN_TICK_MS = 16;   // the rain's clock: ~60 ticks a second
 const uint16_t EYE_DOT = RGB(90, 140, 20);
 
 // ---- Layout --------------------------------------------------------------
@@ -259,6 +435,9 @@ unsigned long volLocalAt = 0;    // last volume change made with the knob
 int clockBase = -1;              // minutes since midnight from Python, -1 = unknown
 unsigned long clockAt = 0;
 unsigned long levelsAt = 0;
+// lv message: 32 TFT bands, VU left, VU right, 13 matrix bands (each 0..255)
+const int TFT_BANDS = 32;
+const int LV_BYTES = TFT_BANDS + 2 + 13;
 
 // Inbox: written by the Bridge thread, read by loop()
 struct InTrack { char src[8], fmt[16], artist[48], title[72], album[56]; int year, no, of, dur, radio; };
@@ -266,15 +445,26 @@ InTrack inTrack;
 volatile bool inTrackNew = false;
 int inSt[6];
 volatile bool inStNew = false;
-uint8_t inLv[18];
+uint8_t inLv[LV_BYTES];
 volatile bool inLvNew = false;
 volatile int inClk = -1;
 volatile int inDev = -1;
+uint8_t inCfg[S_COUNT + 1];             // cfg: the settings, then the last view
+volatile bool inCfgNew = false;
 int devMask = DEV_CD | DEV_USB;            // until Python says otherwise
-InItem inQ[16];                  // menu page/item messages, a small ring buffer
+const int INQ = 40;              // a page is 9 messages; a prefetch can add another 9
+InItem inQ[INQ];                 // menu page/item messages, a small ring buffer
 volatile uint8_t inQHead = 0, inQTail = 0;
-char pageText[8][68];            // the 8 rows on screen
-bool pageHave[8];
+// Menu rows received from Python, kept by index (slot = index % ROW_CACHE).
+const int ROW_CACHE = 32;
+char rowText[ROW_CACHE][68];
+int rowIdx[ROW_CACHE];           // which list index a slot holds, -1 = none
+int reqStart[4];                 // pages asked for recently (start index)...
+unsigned long reqAt[4];          // ...and when, so they aren't asked for again
+uint8_t reqNext = 0;
+// Cursor bar sliding between rows: drawn at barY (pixel y), heading for barTo.
+int barY = -1, barTo = 0;
+unsigned long barStepAt = 0;
 Arduino_LED_Matrix matrix;
 int view = V_NOW;
 bool inMenu = false;
@@ -289,10 +479,17 @@ unsigned long lastFrame = 0;
 bool onBlack = false;            // drawing on a cleared area: text boxes only as wide as the text
 
 // Animation state
-float lv[16], lvL, lvR;
-float barH[16], pkH[16];
-uint8_t pkAge[16];
-uint32_t segMask[16];
+float lv[TFT_BANDS], lvL, lvR;
+const int MAT_COLS = 13, MAT_ROWS = 8;
+float matLv[MAT_COLS];               // targets from Python, 0..1
+float matH[MAT_COLS], matPk[MAT_COLS];   // bar and peak heights in rows
+unsigned long matPkAt[MAT_COLS], matAt = 0;
+uint8_t matShown[MAT_COLS * MAT_ROWS];
+float barH[TFT_BANDS], pkH[TFT_BANDS], pkA[TFT_BANDS];   // bar, peak (segments), peak brightness 0..1
+unsigned long pkAt[TFT_BANDS];                          // when each peak was last pushed up
+uint32_t segMask[TFT_BANDS];                            // bar segments lit on screen
+int8_t pkSeg[TFT_BANDS];                                // peak segment on screen, -1 none
+uint16_t pkCol[TFT_BANDS];                              // ...and its colour
 float vuV[2], vuShown[2];
 float eyeV;
 int shK;
@@ -300,15 +497,12 @@ uint32_t rng = 0x12345678;
 
 // Idle screen (digital rain)
 const int MX_COLS = 26, MX_ROWS = 15, MX_CW = 12, MX_CH = 16, MX_X0 = 4;
-const int CLOCK_EVERY_MS = 20000;
 bool idle = false;
 bool swallowRelease = false;
-unsigned long pausedSince = 0, lastInputAt = 0, rainFrameAt = 0, clockPhaseAt = 0;
-uint8_t clockPhase = 0;          // 0 rain only, 1 time appears, 2 time shown, 3 time dissolves
+unsigned long pausedSince = 0, lastInputAt = 0, rainFrameAt = 0;
 RainCol rain[MX_COLS];
 uint8_t mxGlyph[MX_ROWS][MX_COLS];
-uint8_t mxLevel[MX_ROWS][MX_COLS];   // 0 empty, 1 dark, 2 mid, 3 bright, 4 head
-uint8_t mxLock[MX_ROWS][MX_COLS];    // clock cells: 1 waiting for the rain, 2 lit
+uint8_t mxLevel[MX_ROWS][MX_COLS];   // shade, see MX_SHADE
 
 // Text renderer buffer: one strip of pixels
 uint16_t pbuf[8192];
@@ -370,6 +564,14 @@ void k0ISR() {
 int imin(int a, int b) { return a < b ? a : b; }
 int imax(int a, int b) { return a > b ? a : b; }
 float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+// Colour between a (t = 0) and b (t = 1), in RGB565.
+uint16_t mix565(uint16_t a, uint16_t b, float t) {
+  if (t <= 0) return a;
+  if (t >= 1) return b;
+  int ra = a >> 11, ga = (a >> 5) & 63, ba = a & 31, rb = b >> 11, gb = (b >> 5) & 63, bb = b & 31;
+  int rr = ra + (int)lroundf((rb - ra) * t), gg = ga + (int)lroundf((gb - ga) * t), b2 = ba + (int)lroundf((bb - ba) * t);
+  return (uint16_t)((rr << 11) | (gg << 5) | b2);
+}
 float frand() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return (rng & 0xFFFF) / 65535.0f; }
 
 // ---- UTF-8 text (Latin + Cyrillic) ----
@@ -629,46 +831,93 @@ void nowStatic() {
 }
 
 // ---- View 2: Spectrum ----------------------------------------------------
-const int SP_BARS = 16, SP_SEGS = 16, SP_X0 = 8, SP_BW = 19, SP_TOP = 28, SP_SH = 9;
+// 32 (or 16) bars of 16 segments, 31 Hz .. 16 kHz. A peak segment holds for
+// a moment above its bar, then fades out where it is (a peak-hold display),
+// or falls (Settings > Peaks). 16 bars: the 32 bands in pairs.
+const int SP_SEGS = 16, SP_TOP = 28, SP_SH = 9;
+int SP_BARS = 32, SP_X0 = 16, SP_BW = 9, SP_GAP = 2;     // set by specMode()
+const unsigned long SP_PEAK_HOLD_MS = 600, SP_PEAK_FADE_MS = 450;
 
-void specSeg(int b, int s, bool lit) {
-  uint16_t c;
-  if (s < 11)      c = lit ? GRN : DGRN;
-  else if (s < 14) c = lit ? YEL : DYEL;
-  else             c = lit ? RED : DRED;
-  tft.fillRect(SP_X0 + b * SP_BW, SP_TOP + (SP_SEGS - 1 - s) * SP_SH, SP_BW - 3, SP_SH - 2, c);
+uint16_t segLit(int s) { return s < 11 ? GRN : s < 14 ? YEL : RED; }
+uint16_t segDim(int s) { return s < 11 ? DGRN : s < 14 ? DYEL : DRED; }
+
+void specSegC(int b, int s, uint16_t c) {
+  tft.fillRect(SP_X0 + b * SP_BW, SP_TOP + (SP_SEGS - 1 - s) * SP_SH, SP_BW - SP_GAP, SP_SH - 2, c);
 }
+void specSeg(int b, int s, bool lit) { specSegC(b, s, lit ? segLit(s) : segDim(s)); }
 
 void specStatic() {
   for (int b = 0; b < SP_BARS; b++) {
     for (int s = 0; s < SP_SEGS; s++) specSeg(b, s, false);
-    barH[b] = pkH[b] = 0;
-    pkAge[b] = 0;
+    barH[b] = pkH[b] = pkA[b] = 0;
+    pkAt[b] = 0;
     segMask[b] = 0;
+    pkSeg[b] = -1;
   }
-  struct { int bar; const char *t; } labels[] = {
+  struct Lbl { int bar; const char *t; };
+  static const Lbl l32[] = {
+    {0, "31"}, {3, "63"}, {7, "125"}, {10, "250"}, {14, "500"},
+    {17, "1k"}, {21, "2k"}, {24, "4k"}, {28, "8k"}, {31, "16k"},
+  };
+  static const Lbl l16[] = {
     {0, "31"}, {2, "70"}, {4, "160"}, {6, "380"}, {8, "870"},
     {10, "2k"}, {12, "4.5k"}, {15, "16k"},
   };
-  for (auto &l : labels) {
+  const Lbl *labels = SP_BARS == 32 ? l32 : l16;
+  int nl = SP_BARS == 32 ? 10 : 8;
+  for (int i = 0; i < nl; i++) {
+    const Lbl &l = labels[i];
     int w = strlen(l.t) * 6;
-    int cx = SP_X0 + l.bar * SP_BW + (SP_BW - 3) / 2;
-    text(cx - w / 2, SP_TOP + SP_SEGS * SP_SH + 4, w, l.t, 1, MUTED, BLACK);
+    int cx = SP_X0 + l.bar * SP_BW + (SP_BW - SP_GAP) / 2;
+    int x = imax(0, imin(320 - w, cx - w / 2));
+    text(x, SP_TOP + SP_SEGS * SP_SH + 4, w, l.t, 1, MUTED, BLACK);
   }
 }
 
+// The motion constants below were tuned at 30 fps (one frame = 33 ms). These
+// rescale them to FRAME_MS, so a faster frame rate is smoother, not faster.
+const float FRAME_K = FRAME_MS / 33.0f;
+// Per-frame share of the way to the target (exponential smoothing).
+float easeK(float a) { return 1 - powf(1 - a, FRAME_K); }
+
+// 32 bars, or 16 (the bands in pairs): geometry and labels as before.
+void specMode(bool bars32) {
+  SP_BARS = bars32 ? 32 : 16;
+  SP_X0 = bars32 ? 16 : 8;
+  SP_BW = bars32 ? 9 : 19;
+  SP_GAP = bars32 ? 2 : 3;
+}
+
 void specFrame() {
+  static const float fall = 0.7f * FRAME_K, pkFall = 0.3f * FRAME_K;
+  unsigned long t = millis();
   for (int b = 0; b < SP_BARS; b++) {
-    float target = lv[b] * SP_SEGS;
-    barH[b] = fmaxf(target, barH[b] - 0.7f);
-    if (barH[b] >= pkH[b]) { pkH[b] = barH[b]; pkAge[b] = 0; }
-    else if (++pkAge[b] > 18) pkH[b] = fmaxf(pkH[b] - 0.3f, 0);
+    float level = SP_BARS == 32 ? lv[b] : fmaxf(lv[2 * b], lv[2 * b + 1]);
+    float target = level * SP_SEGS;
+    barH[b] = fmaxf(target, barH[b] - fall);
+    if (barH[b] >= pkH[b]) { pkH[b] = barH[b]; pkAt[b] = t; pkA[b] = 1; }
+    else if (t - pkAt[b] > SP_PEAK_HOLD_MS) {
+      if (spFall) pkH[b] = fmaxf(pkH[b] - pkFall, 0);       // drops, lit
+      else {
+        pkA[b] = 1 - (float)(t - pkAt[b] - SP_PEAK_HOLD_MS) / SP_PEAK_FADE_MS;
+        if (pkA[b] <= 0) { pkA[b] = 0; pkH[b] = barH[b]; }  // gone: the next peak starts from the bar
+      }
+    }
     int h = (int)lroundf(barH[b]), p = (int)lroundf(pkH[b]);
+    // The bar's segments: only the ones that change.
     uint32_t m = h > 0 ? (1UL << h) - 1 : 0;
-    if (p > h && p > 0) m |= 1UL << (p - 1);
-    uint32_t diff = m ^ segMask[b];
+    int ps = (p > h && p > 0 && pkA[b] > 0) ? p - 1 : -1;     // peak segment, above the bar
+    uint32_t shown = segMask[b];
+    if (pkSeg[b] >= 0) shown &= ~(1UL << pkSeg[b]);         // the old peak is redrawn below
+    uint32_t diff = (m ^ shown) & ~(ps >= 0 ? 1UL << ps : 0);
     for (int s = 0; s < SP_SEGS; s++)
       if (diff & (1UL << s)) specSeg(b, s, m & (1UL << s));
+    // The peak: a lit segment fading to the dark one.
+    uint16_t pc = ps >= 0 ? mix565(segDim(ps), segLit(ps), pkA[b]) : 0;
+    if (pkSeg[b] >= 0 && pkSeg[b] != ps && !(m & (1UL << pkSeg[b])))
+      specSeg(b, pkSeg[b], false);                           // where the peak was
+    if (ps >= 0 && (ps != pkSeg[b] || pc != pkCol[b])) specSegC(b, ps, pc);
+    pkSeg[b] = ps; pkCol[b] = pc;
     segMask[b] = m;
   }
 }
@@ -728,7 +977,8 @@ void vuFrame() {
   float target[2] = {lvL, lvR};
   for (int i = 0; i < 2; i++) {
     float t = clampf(target[i], 0, 1);
-    vuV[i] += (t - vuV[i]) * (t > vuV[i] ? 0.30f : 0.10f);
+    static const float up = easeK(0.30f), down = easeK(0.10f);
+    vuV[i] += (t - vuV[i]) * (t > vuV[i] ? up : down);
     float a = VU_MIN + vuV[i] * (VU_MAX - VU_MIN);
     if (fabsf(a - vuShown[i]) < 0.8f) continue;
     vuLine(i, vuShown[i], 8, VU_R - 12, PANEL);
@@ -824,7 +1074,8 @@ void eyeStatic() {
 
 void eyeFrame() {
   float t = clampf((lvL + lvR) / 2, 0, 1);
-  eyeV += (t - eyeV) * (t > eyeV ? 0.35f : 0.12f);
+  static const float up = easeK(0.35f), down = easeK(0.12f);
+  eyeV += (t - eyeV) * (t > eyeV ? up : down);
   int k = eyeTargetK();
   if (k == shK) return;
   if (k < shK) eyeSector(k, shK, EYE_G);
@@ -832,27 +1083,56 @@ void eyeFrame() {
   shK = k;
 }
 
+// ---- LED matrix -----------------------------------------------------------
+// 13 bars, bass on the left: jump up at once, fall smoothly; a peak dot holds
+// for a moment, then falls. Driven by time, not by messages, so the bars keep
+// falling evenly when the music stops. Called from loop(); with FAST_SPI the
+// longest TFT redraw is ~50 ms, short enough not to show on the matrix.
+void matrixStep() {
+  unsigned long t = millis();
+  if (t - matAt < MATRIX_MS) return;
+  float dt = fminf((t - matAt) / 1000.0f, 0.1f);
+  matAt = t;
+  bool fresh = t - levelsAt <= 300;            // nothing new for a while: let it fall
+  uint8_t frame[MAT_COLS * MAT_ROWS];
+  for (int b = 0; b < MAT_COLS; b++) {
+    float target = fresh ? matLv[b] * MAT_ROWS : 0;
+    matH[b] = fmaxf(target, matH[b] - MAT_FALL * dt);
+    if (matH[b] >= matPk[b]) { matPk[b] = matH[b]; matPkAt[b] = t; }
+    else if (t - matPkAt[b] > MAT_PEAK_HOLD_MS) matPk[b] = fmaxf(matPk[b] - MAT_PEAK_FALL * dt, 0);
+    int h = (int)lroundf(matH[b]), p = (int)lroundf(matPk[b]);
+    for (int r = 0; r < MAT_ROWS; r++)             // row 0 is the top
+      frame[r * MAT_COLS + b] = r >= MAT_ROWS - h ? matBarB
+                              : (r == MAT_ROWS - p && p > h) ? matPeakB : 0;
+  }
+  if (memcmp(frame, matShown, sizeof(frame))) {
+    memcpy(matShown, frame, sizeof(frame));
+    matrix.draw(frame);
+  }
+}
+
 // ---- Audio levels from Python ---------------------------------------------
 // lv message: 16 spectrum bands + left + right, each 0..255. If nothing has
 // arrived for a while (paused, stopped, Python busy), everything falls to 0.
 void takeLevels() {
   if (millis() - levelsAt > 300) {
-    for (int b = 0; b < 16; b++) lv[b] = 0;
+    for (int b = 0; b < TFT_BANDS; b++) lv[b] = 0;
     lvL = lvR = 0;
   }
 }
 
 // ---- Marquee: a long title swings left to its end and back ---------------
-// Stands 2 s at each end, moves 3 px every 60 ms (~50 px/s). One step
+// Stands 2 s at each end, moves 1 px every 20 ms (~50 px/s). One step
 // redraws just the glyph rows of the title.
 //
-// Drawn in vertical strips, left to right. The panel is a portrait one
+// Drawn in vertical strips, right to left. The panel is a portrait one
 // turned on its side, so it refreshes our picture column by column. A box
 // sent row by row (top to bottom) would cross that refresh: the top of the
 // letters already moved, the bottom not yet - a comb through the text.
-// Strips sent along the refresh direction leave at most one vertical seam.
-const unsigned long MQ_HOLD_MS = 2000, MQ_STEP_MS = 60;
-const int MQ_PX = 3;
+// Strips sent along the refresh direction (right to left, found by trying
+// both on the menu) leave at most one vertical seam.
+const unsigned long MQ_HOLD_MS = 2000, MQ_STEP_MS = 20;
+const int MQ_PX = 1;                     // 1 px every 20 ms: the same ~50 px/s, smoother
 Marquee mq;
 
 void marqueeSetup() {
@@ -892,7 +1172,9 @@ void marqueeDraw() {
   const uint8_t *gl[72];
   int len = decodeGlyphs(now.title, gl, 72);
   const int SW = 8;                            // strip width, px
-  for (int sx = 0; sx < mq.w; sx += SW) {
+  int strips = (mq.w + SW - 1) / SW;
+  for (int k = 0; k < strips; k++) {
+    int sx = (STRIPS_RTL ? strips - 1 - k : k) * SW;
     int sw = imin(SW, mq.w - sx);
     uint16_t *p = pbuf;
     for (int r = 0; r < mq.h; r++) {
@@ -929,7 +1211,7 @@ void eraseView(int v) {
       break;
     case V_SPECTRUM:
       for (int i = 0; i < SP_BARS; i++)
-        tft.fillRect(SP_X0 + i * SP_BW, SP_TOP, SP_BW - 3, SP_SEGS * SP_SH, BLACK);
+        tft.fillRect(SP_X0 + i * SP_BW, SP_TOP, SP_BW - SP_GAP, SP_SEGS * SP_SH, BLACK);
       tft.fillRect(0, SP_TOP + SP_SEGS * SP_SH + 4, 320, 8, BLACK);
       break;
     case V_VU: {
@@ -955,11 +1237,10 @@ void eraseView(int v) {
 }
 
 // ---- Idle screen: digital rain --------------------------------------------
-// Columns of glyphs fall at different speeds: a pale head, a bright glyph
-// behind it, then the trail fades through mid and dark green. Only the few
-// cells that change are redrawn each frame. Every 20 s the time appears out
-// of the rain: the cells that form the digits light up as the rain passes
-// over them, stay for a few seconds, then dissolve.
+// Columns of glyphs fall at five different speeds, cell by cell as in the
+// film: a pale head, a bright glyph behind it, then the trail fades evenly
+// through six greens to dark. Only the cells whose shade changes are
+// redrawn on a tick.
 int irand(int n) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng % n; }
 
 const uint8_t *rainGlyph(uint8_t id) {
@@ -968,18 +1249,16 @@ const uint8_t *rainGlyph(uint8_t id) {
 
 void mxDraw(int r, int c) {
   int x = MX_X0 + c * MX_CW, y = r * MX_CH;
-  bool lit = mxLock[r][c] == 2;
   uint8_t lv = mxLevel[r][c];
-  if (!lit && lv == 0) { tft.fillRect(x, y, MX_CW, MX_CH, BLACK); return; }
-  if (clockPhase && !lit && lv > 2) lv = 2;      // while the time shows, the rain steps back
-  uint16_t fg = lit ? MX_CLOCK : lv == 4 ? MX_HEAD : lv == 3 ? VFD : lv == 2 ? MX_MID : MX_DARK;
+  if (lv == 0) { tft.fillRect(x, y, MX_CW, MX_CH, BLACK); return; }
+  uint16_t fg = MX_SHADE[lv];
   const uint8_t *g = rainGlyph(mxGlyph[r][c]);
   uint16_t *p = pbuf;
   for (int py = 0; py < MX_CH; py++)
     for (int px = 0; px < MX_CW; px++) {
       int gx = px / 2, gy = py / 2;
       bool on = gx < 5 && ((g[4 - gx] >> gy) & 1);    // mirrored, as in the film
-      *p++ = lit ? (on ? BLACK : MX_CLOCK) : (on ? fg : BLACK);   // clock cells: negative, so digits read as solid shapes
+      *p++ = on ? fg : BLACK;
     }
   tft.startWrite();
   tft.window(x, y, x + MX_CW - 1, y + MX_CH - 1);
@@ -989,11 +1268,8 @@ void mxDraw(int r, int c) {
 
 void mxSet(int r, int c, uint8_t lv) {
   if (r < 0 || r >= MX_ROWS) return;
-  if (lv == 4) {
-    mxGlyph[r][c] = irand(KANA_COUNT + 10);
-    if (mxLock[r][c] == 1) mxLock[r][c] = 2;      // the rain "writes" the clock
-  }
-  if (mxLevel[r][c] == lv && lv != 4) return;
+  if (lv == MX_HEAD) mxGlyph[r][c] = irand(KANA_COUNT + 10);
+  if (mxLevel[r][c] == lv && lv != MX_HEAD) return;
   mxLevel[r][c] = lv;
   mxDraw(r, c);
 }
@@ -1001,75 +1277,36 @@ void mxSet(int r, int c, uint8_t lv) {
 void rainReset(int c, bool first) {
   rain[c].head = first ? -irand(MX_ROWS * 2) : -irand(10);
   rain[c].len = 6 + irand(11);
-  rain[c].period = 1 + irand(3);
-  rain[c].phase = 0;
+  rain[c].period = 3 + irand(5);       // a row every 3..7 ticks: 48..112 ms
+  rain[c].phase = irand(rain[c].period);
+}
+
+// Shade of the cell d rows behind the head of a trail len cells long: the
+// head, one bright glyph, then the trail fades evenly to dark.
+uint8_t rainShade(int d, int len) {
+  if (d == 0) return MX_HEAD;
+  if (d >= len) return 0;
+  if (d == 1) return 7;
+  return 1 + (5 * (len - 1 - d) + (len - 2) / 2) / (len - 2);   // 6 .. 1
 }
 
 void rainStep(int c) {
   RainCol &k = rain[c];
   int h = ++k.head;
-  mxSet(h, c, 4);
-  mxSet(h - 1, c, 3);
-  mxSet(h - 3, c, 2);
-  if (k.len * 2 / 3 > 3) mxSet(h - k.len * 2 / 3, c, 1);
-  mxSet(h - k.len, c, 0);
+  for (int d = 0; d <= k.len; d++) mxSet(h - d, c, rainShade(d, k.len));   // only changes are drawn
   if (h - k.len >= MX_ROWS) rainReset(c, false);
-}
-
-// Big digits, 3x5 cells each
-const uint8_t BIG_DIGITS[10][5] = {
-  {7, 5, 5, 5, 7}, {2, 6, 2, 2, 7}, {7, 1, 7, 4, 7}, {7, 1, 7, 1, 7}, {5, 5, 7, 1, 1},
-  {7, 4, 7, 1, 7}, {7, 4, 7, 5, 7}, {7, 1, 1, 1, 1}, {7, 5, 7, 5, 7}, {7, 5, 7, 1, 7},
-};
-
-void clockTargets() {
-  int m = clockNow();
-  if (m < 0) return;
-  int d[4] = {m / 600, m / 60 % 10, m % 60 / 10, m % 10};
-  int x0[4] = {4, 8, 14, 18};
-  const int top = 5;
-  for (int i = 0; i < 4; i++)
-    for (int r = 0; r < 5; r++)
-      for (int b = 0; b < 3; b++)
-        if (BIG_DIGITS[d[i]][r] & (4 >> b)) mxLock[top + r][x0[i] + b] = 1;
-  mxLock[top + 1][12] = mxLock[top + 3][12] = 1;   // colon
-}
-
-void clockUpdate() {
-  unsigned long t = millis() - clockPhaseAt;
-  if (clockPhase == 0 && t >= CLOCK_EVERY_MS) {
-    clockTargets();
-    clockPhase = 1; clockPhaseAt = millis();
-  } else if (clockPhase == 1 && t >= 1500) {         // light whatever the rain missed
-    for (int r = 0; r < MX_ROWS; r++)
-      for (int c = 0; c < MX_COLS; c++)
-        if (mxLock[r][c] == 1) { mxLock[r][c] = 2; mxGlyph[r][c] = irand(KANA_COUNT + 10); mxDraw(r, c); }
-    clockPhase = 2; clockPhaseAt = millis();
-  } else if (clockPhase == 2 && t >= 3500) {
-    clockPhase = 3; clockPhaseAt = millis();
-  } else if (clockPhase == 3) {                       // dissolve over ~1 s
-    int left = 0;
-    for (int r = 0; r < MX_ROWS; r++)
-      for (int c = 0; c < MX_COLS; c++)
-        if (mxLock[r][c]) {
-          if (irand(100) < 12) { mxLock[r][c] = 0; mxLevel[r][c] = 0; mxDraw(r, c); }
-          else left++;
-        }
-    if (!left) { clockPhase = 0; clockPhaseAt = millis(); }
-  }
 }
 
 void rainFrame() {
   for (int c = 0; c < MX_COLS; c++)
     if (++rain[c].phase >= rain[c].period) { rain[c].phase = 0; rainStep(c); }
-  for (int i = 0; i < 3; i++) {                       // glyphs flicker in the trails
+  {                                                   // glyphs flicker in the trails
     int r = irand(MX_ROWS), c = irand(MX_COLS);
-    if (!mxLock[r][c] && (mxLevel[r][c] == 2 || mxLevel[r][c] == 3)) {
+    if (mxLevel[r][c] >= 4 && mxLevel[r][c] < MX_HEAD) {
       mxGlyph[r][c] = irand(KANA_COUNT + 10);
       mxDraw(r, c);
     }
   }
-  clockUpdate();
 }
 
 void enterIdle() {
@@ -1077,10 +1314,7 @@ void enterIdle() {
   mq.on = false;
   inMenu = false;
   memset(mxLevel, 0, sizeof(mxLevel));
-  memset(mxLock, 0, sizeof(mxLock));
   for (int c = 0; c < MX_COLS; c++) rainReset(c, true);
-  clockPhase = 0;
-  clockPhaseAt = millis() - (CLOCK_EVERY_MS - 8000);   // first time after ~8 s
   tft.fillScreen(BLACK);
 }
 
@@ -1104,6 +1338,10 @@ void drawViewFull() {
   marqueeSetup();
 }
 
+void menuRows();
+void fadeCancel();
+void settingSet(int k, int v);
+
 void switchView(int d) {
   unsigned long t0 = millis();
   eraseView(view);
@@ -1112,7 +1350,59 @@ void switchView(int d) {
   drawViewContent();
   onBlack = false;
   marqueeSetup();
+  Bridge.notify("set", S_LAST_VIEW, view);      // for Start view = Last
   showMs(millis() - t0);
+}
+
+// Straight to view v (the start view).
+void showView(int v) {
+  if (v == view) return;
+  if (inMenu || idle) { view = v; return; }    // drawn when the menu / rain ends
+  eraseView(view);
+  view = v;
+  onBlack = true;
+  drawViewContent();
+  onBlack = false;
+  marqueeSetup();
+}
+
+// A setting changed: make it so.
+void applySetting(int k) {
+  int v = setv[k];
+  switch (k) {
+    case S_BRIGHT: tft.setBacklight(v >= 9 ? 255 : (v + 1) * 255 / 10); break;
+    case S_SPEC: {
+      bool vis = !inMenu && !idle && view == V_SPECTRUM;
+      if (vis) eraseView(V_SPECTRUM);
+      specMode(v == 1);
+      if (vis) { onBlack = true; specStatic(); onBlack = false; }
+      break;
+    }
+    case S_PEAKS:  spFall = v == 1; break;
+    case S_RAIN:   idleMs = RAIN_MIN[v] * 60000UL; break;
+    case S_MATBRI: matBarB = v + 1; matPeakB = imax(1, (v + 1) * 4 / 7); break;
+    case S_CURSOR: menuBarFade = v == 1; fadeCancel(); break;
+    default: break;                              // sensitivity: Python; start view: at boot
+  }
+}
+
+void applyCfg() {
+  uint8_t c[S_COUNT + 1];
+  noInterrupts();
+  memcpy(c, inCfg, sizeof(c));
+  inCfgNew = false;
+  interrupts();
+  for (int k = 0; k < S_COUNT; k++) {
+    uint8_t v = c[k] < S_N[k] ? c[k] : S_DEFAULT[k];
+    if (v != setv[k] || !cfgSeen) { setv[k] = v; applySetting(k); }
+  }
+  lastView = c[S_COUNT] < 4 ? c[S_COUNT] : -1;
+  if (!cfgSeen) {                              // first one after boot: the start view
+    cfgSeen = true;
+    int sv = setv[S_START] == 4 ? lastView : setv[S_START];
+    if (sv >= 0) showView(sv);
+  }
+  if (inMenu && !idle && st[depth].id == L_SETTINGS) menuRows();
 }
 
 // The visible view's track text, erased before a new track is drawn: with
@@ -1205,7 +1495,7 @@ void onSt(int state, int el, int vol, int rpt, int rnd, int song) {
 }
 
 void onLv(std::vector<uint8_t> v) {
-  if (v.size() != sizeof(inLv)) return;
+  if (v.size() != sizeof(inLv)) return;           // an older main.py: ignore
   noInterrupts();
   memcpy(inLv, v.data(), sizeof(inLv));
   inLvNew = true;
@@ -1214,10 +1504,17 @@ void onLv(std::vector<uint8_t> v) {
 
 void onClk(int minutes) { inClk = minutes; }
 void onDev(int mask) { inDev = mask; }
+void onCfg(std::vector<uint8_t> v) {           // the settings, then the last view
+  if (v.size() != sizeof(inCfg)) return;
+  noInterrupts();
+  memcpy(inCfg, v.data(), sizeof(inCfg));
+  inCfgNew = true;
+  interrupts();
+}
 
 void pushItem(int8_t kind, int list, int ctx, int index, int total, const char *text) {
   noInterrupts();
-  uint8_t next = (inQHead + 1) % 16;
+  uint8_t next = (inQHead + 1) % INQ;
   if (next != inQTail) {                       // full: drop (the page is re-requested on demand)
     InItem &it = inQ[inQHead];
     it.kind = kind; it.list = list; it.ctx = ctx; it.index = index; it.total = total;
@@ -1230,10 +1527,6 @@ void pushItem(int8_t kind, int list, int ctx, int index, int total, const char *
 void onPage(int list, int ctx, int start, int total) { pushItem(0, list, ctx, start, total, ""); }
 void onItem(int list, int ctx, int index, String text) { pushItem(1, list, ctx, index, 0, text.c_str()); }
 
-// The LED matrix has its own driver, it can be drawn right here.
-void draw(std::vector<uint8_t> frame) {
-  if (frame.size() == 104) matrix.draw(frame.data());
-}
 
 // ---- Applying the inbox (loop) ---------------------------------------------
 void applyTrack() {
@@ -1282,13 +1575,14 @@ void applyStatus() {
 
 void applyMenuItem(const InItem &it);
 void menuDevicesChanged();
+void applyCfg();
 
 void applyInbox() {
   while (inQTail != inQHead) {
     InItem it;
     noInterrupts();
     it = inQ[inQTail];
-    inQTail = (inQTail + 1) % 16;
+    inQTail = (inQTail + 1) % INQ;
     interrupts();
     applyMenuItem(it);
   }
@@ -1296,9 +1590,10 @@ void applyInbox() {
   if (inStNew) applyStatus();
   if (inLvNew) {
     noInterrupts();
-    for (int b = 0; b < 16; b++) lv[b] = inLv[b] / 255.0f;
-    lvL = inLv[16] / 255.0f;
-    lvR = inLv[17] / 255.0f;
+    for (int b = 0; b < TFT_BANDS; b++) lv[b] = inLv[b] / 255.0f;
+    lvL = inLv[TFT_BANDS] / 255.0f;
+    lvR = inLv[TFT_BANDS + 1] / 255.0f;
+    for (int b = 0; b < MAT_COLS; b++) matLv[b] = inLv[TFT_BANDS + 2 + b] / 255.0f;
     inLvNew = false;
     interrupts();
     levelsAt = millis();
@@ -1307,6 +1602,7 @@ void applyInbox() {
     clockBase = inClk; clockAt = millis(); inClk = -1;
     if (!inMenu && !idle) headerClock();
   }
+  if (inCfgNew) applyCfg();
   if (inDev >= 0) {
     int m = inDev; inDev = -1;
     if (m != devMask) { devMask = m; menuDevicesChanged(); }
@@ -1321,15 +1617,48 @@ void sendCmd(int code) { Bridge.notify("cmd", code); }
 // ---- Menu data -----------------------------------------------------------
 int listCount(const Level &l) {
   if (l.id == L_ROOT) return ROOT_N;
+  if (l.id == L_SETTINGS) return S_COUNT;
   return l.total;                              // -1 until Python answers
 }
 
+const char *cachedRow(int idx) {
+  int s = idx % ROW_CACHE;
+  return idx >= 0 && rowIdx[s] == idx ? rowText[s] : nullptr;
+}
+
+bool editing = false;                  // a Settings row is being changed
+uint8_t editOrig = 0;                   // its value before, for K0
+
+void settingText(int k, int v, char *out, size_t n) {
+  static const char *const views[] = {"Now", "Spectrum", "VU", "Eye", "Last"};
+  switch (k) {
+    case S_BRIGHT: snprintf(out, n, "%d%%", (v + 1) * 10); break;
+    case S_SPEC:   snprintf(out, n, "%s", v ? "32 bars" : "16 bars"); break;
+    case S_PEAKS:  snprintf(out, n, "%s", v ? "fall" : "fade"); break;
+    case S_RAIN:   if (RAIN_MIN[v]) snprintf(out, n, "%d min", RAIN_MIN[v]); else snprintf(out, n, "never"); break;
+    case S_MATBRI: snprintf(out, n, "%d", v + 1); break;
+    case S_SENS:   snprintf(out, n, "-%d dB", 36 + 3 * v); break;
+    case S_START:  snprintf(out, n, "%s", views[v]); break;
+    default:       snprintf(out, n, "%s", v ? "fade" : "slide"); break;
+  }
+}
+
 void listLabel(const Level &l, int i, char *out, size_t n) {
-  int row = i - i / ROWS * ROWS;
-  if (l.id == L_ROOT) snprintf(out, n, "%s", ROOT_ITEMS[i]);
-  else if (l.total == 0) snprintf(out, n, l.id == L_CD ? "No disc" : "(empty)");
-  else if (l.total < 0 && l.id == L_CD) snprintf(out, n, "Reading disc...");
-  else snprintf(out, n, "%s", pageHave[row] ? pageText[row] : "...");
+  if (l.id == L_ROOT) { snprintf(out, n, "%s", ROOT_ITEMS[i]); return; }
+  if (l.id == L_SETTINGS) {                    // name on the left, value on the right
+    char v[20], w[24];
+    settingText(i, setv[i], v, sizeof(v));
+    if (editing && i == l.cursor) snprintf(w, sizeof(w), "<%s>", v);
+    else snprintf(w, sizeof(w), "%s", v);
+    const int cols = (ROW_W - 12 - 18) / 12;
+    int pad = imax(1, cols - (int)strlen(S_NAMES[i]) - (int)strlen(w));
+    snprintf(out, n, "%s%*s%s", S_NAMES[i], pad, "", w);
+    return;
+  }
+  if (l.total == 0) { snprintf(out, n, l.id == L_CD ? "No disc" : "(empty)"); return; }
+  if (l.total < 0 && l.id == L_CD) { snprintf(out, n, "Reading disc..."); return; }
+  const char *t = cachedRow(i);
+  snprintf(out, n, "%s", t ? t : "...");
 }
 
 const char *listTitle(const Level &l) {
@@ -1341,12 +1670,13 @@ const char *listTitle(const Level &l) {
     case L_ALBUMS: return "ALBUMS";
     case L_RADIO: return "RADIO";
     case L_USB: return "USB";
+    case L_SETTINGS: return "SETTINGS";
     default: return "CD";
   }
 }
 
 bool opensSubmenu(const Level &l) { return l.id == L_ROOT || l.id == L_ARTISTS; }
-bool fromPython(const Level &l) { return l.id != L_ROOT; }
+bool fromPython(const Level &l) { return l.id != L_ROOT && l.id != L_SETTINGS; }
 
 // Root items for devices that are not connected: drawn dim, no submenu.
 bool rootAvailable(int i) {
@@ -1356,8 +1686,16 @@ bool rootAvailable(int i) {
   return true;
 }
 
-// ---- Menu drawing --------------------------------------------------------
-int pageTop(int c) { return c / ROWS * ROWS; }
+// ---- Menu rows: scrolled one at a time, fetched a page ahead ---------------
+// The list scrolls by single rows, keeping one row of context above and
+// below the cursor; press + turn still jumps a page. Rows come from Python
+// a page (8) at a time into a small cache, and the next page is asked for
+// before the cursor gets there. The cursor bar slides between rows.
+// The bar moves at most BAR_MAX_PX a frame: a frame the panel catches mid-
+// write then shows the bar off by a few pixels at a seam, not by a whole
+// row. (The list itself only moves when it scrolls; the bar is what tears.)
+const unsigned long BAR_STEP_MS = 16;
+const int BAR_MAX_PX = 4, BAR_MIN_PX = 2;
 
 void menuHeader() {
   Level &l = st[depth];
@@ -1370,47 +1708,149 @@ void menuHeader() {
   textR(220, 0, 100, HEAD_H, 3, 6, b, 2, MUTED, BLACK);
 }
 
-void menuRow(int i) {
+int rowY(int i) { return ROW_Y0 + i * ROW_H; }
+int cursorY() { Level &l = st[depth]; return rowY(l.cursor - l.top); }
+
+// Paints row slots i0..i1 (0..ROWS-1) with the cursor bar wherever barY
+// says (while it slides it covers parts of two rows). Sent in vertical
+// strips across all those rows at once, for the same reason as the
+// marquee: the panel refreshes column by column, and rows sent one after
+// another (each top to bottom) made the bar look cut along a diagonal.
+// Fading cursor (menuBarFade): the bar doesn't move; the old row fades
+// out while the new one fades in, over FADE_STEPS frames. A frame the panel
+// catches halfway then shows two nearby shades, not the bar in two places.
+const int FADE_STEPS = 4;
+const unsigned long FADE_STEP_MS = 16;
+bool fadeOn = false;
+int fadeOld = -1, fadeNew = -1, fadeK = 0;     // list indexes, frame
+float fadeOldFrom = 1;                         // the old row's level when it began fading
+unsigned long fadeAt = 0;
+
+
+void fadeCancel() { fadeOn = false; }
+
+float barLevel(int idx) {
   Level &l = st[depth];
-  int idx = pageTop(l.cursor) + i;
-  int y = ROW_Y0 + i * ROW_H;
+  if (!fadeOn) return idx == l.cursor ? 1 : 0;
+  float f = (float)fadeK / FADE_STEPS;
+  if (idx == fadeNew) return f;
+  if (idx == fadeOld) return fadeOldFrom * (1 - f);
+  return 0;
+}
+
+// The bar is dim on a root item whose device is missing.
+uint16_t barColorShown = 0;
+uint16_t barColor() {
+  Level &l = st[depth];
+  if (editing) return AMB;                     // changing a setting
+  return l.id == L_ROOT && !rootAvailable(l.cursor) ? MUTED : VFD;
+}
+
+// Paints pixel bands [ys[2k], ys[2k+1]) of row slots i0..i1, columns xa..xb
+// (xb < 0: as wide as needed). menuPaint() is the whole rows; a sliding bar
+// only repaints the few pixel rows its edges crossed.
+void menuPaintArea(int i0, int i1, const int *ys, int nb, int xa, int xb) {
+  Level &l = st[depth];
   int n = listCount(l);
   if (n <= 0) n = 1;                           // loading ("...") or empty ("(empty)"): one row
-  if (idx >= n) {
-    if (rowW[i] > 0) tft.fillRect(0, y, rowW[i], ROW_H, BLACK);
-    rowW[i] = 0;
-    return;
+  struct Slot { const uint8_t *gl[25]; int len; uint16_t fg, bfg, bbg; bool arrow, used, lit; };
+  Slot sl[ROWS];
+  const uint8_t *ar[1];
+  decodeGlyphs(">", ar, 1);
+  uint16_t bar = barColor();
+  barColorShown = bar;
+  int x1 = 0;                                  // paint only as wide as needed
+  for (int i = i0; i <= i1; i++) {
+    Slot &q = sl[i];
+    int idx = l.top + i;
+    q.used = idx < n;
+    q.len = 0; q.arrow = false; q.fg = VFD; q.lit = false;
+    bool off = l.id == L_ROOT && !rootAvailable(idx);
+    if (q.used) {
+      char b[64];
+      listLabel(l, idx, b, sizeof(b));
+      q.fg = off ? LINE : VFD;
+      q.len = imin(decodeGlyphs(b, q.gl, 25), (ROW_W - 12 - 18) / 12);
+      q.arrow = opensSubmenu(l) && !off && idx == l.cursor &&
+                (menuBarFade ? !fadeOn : barY == rowY(i));
+    }
+    if (menuBarFade) {                       // this row's share of the bar, 0..1
+      float lv = q.used ? barLevel(idx) : 0;
+      uint16_t c = editing && idx == l.cursor ? AMB : off ? MUTED : VFD;
+      q.lit = lv > 0;
+      q.bbg = mix565(BLACK, c, lv);            // the bar fades in or out...
+      q.bfg = mix565(q.fg, BLACK, lv);         // ...and its text with it
+    }
+    bool barHere = menuBarFade ? q.lit
+                 : barY >= 0 && barY < rowY(i) + ROW_H && barY + ROW_H - 1 > rowY(i);
+    x1 = imax(x1, barHere || q.used ? ROW_W : 0);
+    x1 = imax(x1, rowW[i]);                     // what was drawn there before goes
   }
-  char b[64];
-  listLabel(l, idx, b, sizeof(b));
-  bool off = l.id == L_ROOT && !rootAvailable(idx);
-  uint16_t fg = off ? LINE : VFD, bar = off ? MUTED : VFD;
-  if (idx == l.cursor) {
-    tft.fillRect(0, y, 6, ROW_H, BLACK);
-    textBox(6, y, ROW_W - 6, ROW_H - 1, 6, 2, b, 2, BLACK, bar);
-    tft.fillRect(6, y + ROW_H - 1, ROW_W - 6, 1, BLACK);
-    if (opensSubmenu(l) && !off) textBox(ROW_W - 18, y, 12, ROW_H - 1, 0, 2, ">", 2, BLACK, bar);
-    rowW[i] = ROW_W;
-  } else {
-    int w = imin(ROW_W, 12 + u8len(b) * 12);
-    textBox(0, y, imax(w, rowW[i]), ROW_H, 12, 2, b, 2, fg, BLACK);
-    rowW[i] = w;
+  if (xb >= 0) x1 = xb;
+  if (x1 <= xa) return;
+  const int SW = 8;                            // strip width, px
+  int strips = (x1 - xa + SW - 1) / SW;
+  tft.startWrite();
+  for (int k = 0; k < strips; k++) for (int bnd = 0; bnd < nb; bnd++) {
+    int sx = xa + (STRIPS_RTL ? strips - 1 - k : k) * SW;
+    int w = imin(SW, x1 - sx);
+    int y0 = ys[2 * bnd], h = ys[2 * bnd + 1] - y0;
+    if (h <= 0) continue;
+    uint16_t *p = pbuf;
+    for (int yy = y0; yy < y0 + h; yy++) {
+      int i = (yy - ROW_Y0) / ROW_H, r = (yy - ROW_Y0) % ROW_H;
+      Slot &q = sl[i];
+      bool inBar = menuBarFade ? q.lit && r < ROW_H - 1
+                                 : barY >= 0 && yy >= barY && yy < barY + ROW_H - 1;
+      int gy = r - 2;
+      bool inY = q.used && gy >= 0 && gy < 16;
+      gy /= 2;
+      for (int c = sx; c < sx + w; c++) {
+        bool on = false;
+        if (inY) {
+          int gx = c - 12;
+          if (gx >= 0 && gx / 12 < q.len && (gx / 2) % 6 < 5) on = (q.gl[gx / 12][(gx / 2) % 6] >> gy) & 1;
+          if (q.arrow && c >= ROW_W - 18 && c < ROW_W - 8) on = (ar[0][(c - (ROW_W - 18)) / 2] >> gy) & 1;
+        }
+        bool b2 = inBar && c >= 6;
+        if (menuBarFade) *p++ = b2 ? (on ? q.bfg : q.bbg) : (on ? q.fg : BLACK);
+        else *p++ = b2 ? (on ? BLACK : bar) : (on ? q.fg : BLACK);
+      }
+    }
+    tft.window(sx, y0, sx + w - 1, y0 + h - 1);
+    tft.sendPixels(pbuf, (size_t)w * h);
   }
+  tft.endWrite();
 }
+
+void menuPaint(int i0, int i1) {
+  int ys[2] = {rowY(i0), rowY(i1) + ROW_H};
+  menuPaintArea(i0, i1, ys, 1, 0, -1);
+  Level &l = st[depth];
+  int n = imax(1, listCount(l));
+  for (int i = i0; i <= i1; i++) rowW[i] = l.top + i < n ? ROW_W : 0;
+}
+
+void menuRow(int i) { menuPaint(i, i); }
 
 void menuScrollbar() {
   Level &l = st[depth];
   int n = imax(0, listCount(l)), x = 310, y = ROW_Y0, h = ROWS * ROW_H - 1;
   tft.fillRect(ROW_W, y, 320 - ROW_W, h, BLACK);
   if (n <= ROWS) return;
-  int pages = (n + ROWS - 1) / ROWS;
-  int th = imax(8, h / pages);
-  int ty = y + (long)(h - th) * (pageTop(l.cursor) / ROWS) / (pages - 1);
+  int th = imax(8, h * ROWS / n);
+  int ty = y + (long)(h - th) * l.top / (n - ROWS);
   tft.fillRect(x, y, 3, h, DIM);
   tft.fillRect(x, ty, 3, th, MUTED);
 }
 
-void menuRows();
+void menuRows() {
+  fadeOn = false;
+  barY = cursorY();                            // a full redraw ends any slide
+  barTo = barY;
+  menuPaint(0, ROWS - 1);
+  menuScrollbar();
+}
 
 // dev(mask) arrived: only the root page shows it.
 void menuDevicesChanged() {
@@ -1418,7 +1858,9 @@ void menuDevicesChanged() {
 }
 
 void menuHint() {
-  textBox(0, 204, 276, 22, 8, 2, "press:open  K0:back", 2, MUTED, BLACK);
+  const char *h = editing ? "press:keep  K0:undo"
+                : st[depth].id == L_SETTINGS ? "press:change K0:back" : "press:open  K0:back";
+  textBox(0, 204, 276, 22, 8, 2, h, 2, editing ? AMB : MUTED, BLACK);
 }
 
 void toast(const char *msg) {
@@ -1426,16 +1868,35 @@ void toast(const char *msg) {
   toastUntil = millis() + 1500;
 }
 
-void menuRows() {
-  for (int i = 0; i < ROWS; i++) menuRow(i);
-  menuScrollbar();
+// A new list: forget the rows and requests of the old one.
+void menuForget() {
+  for (int i = 0; i < ROW_CACHE; i++) rowIdx[i] = -1;
+  for (int i = 0; i < 4; i++) reqAt[i] = 0, reqStart[i] = -1;
 }
 
-// Ask Python for the page under the cursor; its rows show "..." until then.
-void requestPage() {
+// Ask Python for the page starting at `start` unless we have it or just asked.
+void requestChunk(int start) {
   Level &l = st[depth];
-  for (int i = 0; i < ROWS; i++) pageHave[i] = false;
-  if (fromPython(l)) Bridge.notify("get", (int)l.id, l.ctx, pageTop(l.cursor));
+  if (!fromPython(l) || start < 0 || (l.total >= 0 && start >= imax(l.total, 1))) return;
+  int end = l.total >= 0 ? imin(start + ROWS, l.total) : start + ROWS;
+  bool missing = false;
+  for (int i = start; i < end && !missing; i++) missing = !cachedRow(i);
+  if (!missing && l.total >= 0) return;
+  for (int k = 0; k < 4; k++)
+    if (reqStart[k] == start && millis() - reqAt[k] < 1500) return;
+  reqStart[reqNext] = start; reqAt[reqNext] = millis(); reqNext = (reqNext + 1) % 4;
+  Bridge.notify("get", (int)l.id, l.ctx, start);
+}
+
+// The pages under the visible rows, plus the next one in the direction of travel.
+void requestVisible(int dir) {
+  Level &l = st[depth];
+  int a = l.top / ROWS * ROWS, b = (l.top + ROWS - 1) / ROWS * ROWS;
+  requestChunk(a);
+  if (b != a) requestChunk(b);
+  if (l.total < 0) return;                     // length unknown yet: no prefetch
+  if (dir > 0) requestChunk(b + ROWS);
+  if (dir < 0) requestChunk(a - ROWS);
 }
 
 void applyMenuItem(const InItem &it) {
@@ -1443,29 +1904,30 @@ void applyMenuItem(const InItem &it) {
   Level &l = st[depth];
   if (it.list != l.id || it.ctx != l.ctx) return;           // an old answer
   if (it.kind == 0) {
-    if (it.index != pageTop(l.cursor)) return;
+    bool changed = it.total != l.total;
     l.total = it.total;
-    if (l.total > 0 && l.cursor >= l.total) {               // the list got shorter
-      l.cursor = l.total - 1;
-      requestPage();
-    }
-    menuHeader();
-    menuRows();
+    if (l.total > 0 && l.cursor >= l.total) l.cursor = l.total - 1;   // the list got shorter
+    int maxTop = imax(0, l.total - ROWS);
+    if (l.top > maxTop) l.top = maxTop;
+    if (l.cursor < l.top) l.top = l.cursor;
+    if (changed) { menuHeader(); menuRows(); requestVisible(0); }
   } else {
-    int row = it.index - pageTop(l.cursor);
-    if (row < 0 || row >= ROWS) return;
-    snprintf(pageText[row], sizeof(pageText[row]), "%s", it.text);
-    pageHave[row] = true;
-    menuRow(row);
+    int s = it.index % ROW_CACHE;
+    snprintf(rowText[s], sizeof(rowText[s]), "%s", it.text);
+    rowIdx[s] = it.index;
+    int row = it.index - l.top;
+    if (row >= 0 && row < ROWS) menuRow(row);
   }
 }
 
 void menuEnter() {
   unsigned long t0 = millis();
   inMenu = true;
+  editing = false;
   mq.on = false;
   depth = 0;
-  st[0] = {L_ROOT, 0, 0, ROOT_N, ""};
+  st[0] = {L_ROOT, 0, 0, ROOT_N, "", 0};
+  menuForget();
   eraseView(view);
   for (int i = 0; i < ROWS; i++) rowW[i] = 0;       // rows area is black now
   tft.fillRect(276, 204, 44, 24, BLACK);           // volume number
@@ -1484,10 +1946,12 @@ void menuOpen(uint8_t id, int ctx, int cursor) {
   unsigned long t0 = millis();
   clearToast();
   depth++;
-  st[depth] = {id, ctx, cursor, -1, ""};
-  requestPage();
+  st[depth] = {id, ctx, cursor, -1, "", imax(0, cursor - 3)};   // the cursor a bit below the top
+  menuForget();
+  requestVisible(1);
   menuHeader();
   menuRows();
+  menuHint();
   showMs(millis() - t0);
 }
 
@@ -1505,32 +1969,136 @@ void menuExit(int newView) {
 }
 
 void menuBack() {
+  if (editing) {                               // K0 while changing: put it back
+    Level &l = st[depth];
+    editing = false;
+    if (setv[l.cursor] != editOrig) settingSet(l.cursor, editOrig);
+    menuRow(l.cursor - l.top);
+    menuHint();
+    return;
+  }
   if (depth == 0) { menuExit(-1); return; }
   unsigned long t0 = millis();
   clearToast();
   depth--;
-  requestPage();                               // only one page is kept: fetch it again
+  menuForget();                                // the cache held the deeper list
+  requestVisible(0);
   menuHeader();
   menuRows();
+  menuHint();
   showMs(millis() - t0);
+}
+
+// Redraws the rows the bar covered at `from` and covers now (at most 3).
+// The bar moved from `from` to barY. A step shorter than the bar changes
+// only the pixel rows its top and bottom edges crossed (and the ">" that
+// goes or comes): a few rows instead of two whole ones, ~1 ms instead of
+// ~8, so the panel rarely catches a write halfway.
+void barRedraw(int from) {
+  int lo = imin(from, barY), hi = imax(from, barY) + ROW_H;
+  int i0 = ROWS, i1 = -1;
+  for (int i = 0; i < ROWS; i++) {
+    int y = rowY(i);
+    if (y + ROW_H > lo && y < hi) { i0 = imin(i0, i); i1 = imax(i1, i); }
+  }
+  if (i1 < 0) return;
+  int d = abs(barY - from);
+  if (d >= ROW_H - 1 || from < 0 || barColor() != barColorShown) { menuPaint(i0, i1); return; }
+  int a = imin(from, barY), b = imax(from, barY);
+  int ys[4] = {a, b, a + ROW_H - 1, b + ROW_H - 1};   // top edge, bottom edge
+  menuPaintArea(i0, i1, ys, 2, 0, ROW_W);
+  int arrowYs[2] = {rowY(i0), rowY(i1) + ROW_H};
+  menuPaintArea(i0, i1, arrowYs, 1, ROW_W - 18, ROW_W - 8);   // the ">" column
+}
+
+// One frame of the cursor bar's slide; called from loop(). Half the
+// remaining way, between BAR_MIN_PX and BAR_MAX_PX (small steps: a torn
+// frame shows a small step), faster when it falls behind on a fast spin.
+void paintIdx(int idx) {
+  Level &l = st[depth];
+  if (idx >= l.top && idx < l.top + ROWS) menuRow(idx - l.top);
+}
+
+// The cursor moved from row `from` within the visible rows: start a fade.
+void fadeStart(int from) {
+  Level &l = st[depth];
+  int stale = -1;
+  float fromLevel = 1;
+  if (fadeOn) {                                // a fade still running: hurry it along
+    fromLevel = from == fadeNew ? (float)fadeK / FADE_STEPS : 0;
+    if (fadeOld != l.cursor) stale = fadeOld;  // that one goes dark at once
+  }
+  fadeOn = true;
+  fadeOld = from; fadeNew = l.cursor; fadeK = 1; fadeOldFrom = fromLevel;
+  fadeAt = millis();
+  if (stale >= 0 && stale != from) paintIdx(stale);
+  paintIdx(fadeOld);
+  paintIdx(fadeNew);
+}
+
+void fadeStep() {
+  unsigned long t = millis();
+  if (t - fadeAt < FADE_STEP_MS) return;
+  fadeAt = t;
+  if (++fadeK >= FADE_STEPS) fadeOn = false;   // the last frame also brings back the ">"
+  paintIdx(fadeOld);
+  paintIdx(fadeNew);
+}
+
+void menuBarStep() {
+  if (menuBarFade) { if (fadeOn) fadeStep(); return; }
+  if (barY == barTo) return;
+  unsigned long t = millis();
+  if (t - barStepAt < BAR_STEP_MS) return;
+  barStepAt = t;
+  int d = barTo - barY, a = abs(d);
+  int step = imin(a, imax(BAR_MIN_PX, imin(BAR_MAX_PX, a / 2)));
+  if (a > 2 * ROW_H) step = a / 3;             // far behind on a fast spin: catch up
+  int from = barY;
+  barY += d > 0 ? step : -step;
+  barRedraw(from);
+}
+
+// Settings > a row: turn changes the value at once, press keeps it, K0 puts
+// the old one back. Every change goes to Python, which applies its own
+// (sensitivity) and saves them all.
+void settingSet(int k, int v) {
+  setv[k] = v;
+  applySetting(k);
+  Bridge.notify("set", k, v);
 }
 
 void menuMove(int d) {
   Level &l = st[depth];
+  if (editing) {
+    int k = l.cursor;
+    int v = imax(0, imin(S_N[k] - 1, setv[k] + d));
+    if (v != setv[k]) { settingSet(k, v); menuRow(k - l.top); }
+    return;
+  }
   int n = listCount(l);
   if (n <= 0) return;                          // still loading
   int c = imax(0, imin(n - 1, l.cursor + d));
   if (c == l.cursor) return;
-  int old = l.cursor;
+  int oldCursor = l.cursor;
   l.cursor = c;
-  if (pageTop(c) != pageTop(old)) {
+  int top = l.top;                             // keep a row of context above and below
+  if (c < top + 1) top = c - 1;
+  if (c > top + ROWS - 2) top = c - ROWS + 2;
+  top = imax(0, imin(top, imax(0, n - ROWS)));
+  if (top != l.top) {
     unsigned long t0 = millis();
-    requestPage();
-    menuRows();
+    int dir = top > l.top ? 1 : -1;
+    l.top = top;
+    menuRows();                                // ~25 ms with FAST_SPI
+    requestVisible(dir);
     showMs(millis() - t0);
+  } else if (menuBarFade) {
+    fadeStart(oldCursor);
   } else {
-    menuRow(old - pageTop(old));
-    menuRow(c - pageTop(c));
+    barTo = cursorY();                         // slide from wherever the bar is now
+    barStepAt = 0;
+    menuBarStep();
   }
   char b[16];
   snprintf(b, sizeof(b), "%d/%d", c + 1, n);
@@ -1541,6 +2109,14 @@ void menuSelect() {
   Level &l = st[depth];
   int i = l.cursor;
   switch (l.id) {
+    case L_SETTINGS:
+      editing = !editing;                      // press: start changing / keep it
+      if (editing) editOrig = setv[i];
+      barColorShown = 0;                       // the bar changes colour: repaint whole
+      menuRow(i - l.top);
+      toastUntil = 0;
+      menuHint();
+      break;
     case L_ROOT: {
       uint8_t id = ROOT_LISTS[i];
       if (!rootAvailable(i)) { toast(id == L_CD ? "No CD drive" : "No USB stick"); break; }
@@ -1548,10 +2124,10 @@ void menuSelect() {
       break;
     }
     case L_ARTISTS: {
-      int row = i - pageTop(i);
-      if (!pageHave[row]) break;               // not loaded yet
+      const char *t = cachedRow(i);
+      if (!t) break;                           // not loaded yet
       char name[40];
-      snprintf(name, sizeof(name), "%s", pageText[row]);
+      snprintf(name, sizeof(name), "%s", t);
       menuOpen(L_ARTIST_ALBUMS, i, 0);
       snprintf(st[depth].title, sizeof(st[depth].title), "%s", name);
       menuHeader();
@@ -1567,7 +2143,7 @@ void menuSelect() {
 
 void menuLong() {
   Level &l = st[depth];
-  if (l.id == L_ROOT || l.id == L_QUEUE || listCount(l) <= 0) return;
+  if (l.id == L_ROOT || l.id == L_QUEUE || l.id == L_SETTINGS || listCount(l) <= 0) return;
   Bridge.notify("sel", (int)l.id, l.ctx, l.cursor, 1);
   toast("Added to queue");
 }
@@ -1675,18 +2251,20 @@ void setup() {
   tft.setBacklight(255);
   tft.begin16(SPI16, 16000000);
   tft.setRotation(1);
+  if (PANEL_FRCTRL2 != 0x0F) tft.frameRate(PANEL_FRCTRL2);
+  tft.beginFast(FAST_SPI);       // after the library's own setup commands
   tft.fillScreen(BLACK);
 
   snprintf(now.src, sizeof(now.src), "MPD");
   drawViewFull();
 
   Bridge.begin();
-  Bridge.provide("draw", draw);
   Bridge.provide("trk", onTrk);
   Bridge.provide("st", onSt);
   Bridge.provide("lv", onLv);
   Bridge.provide("clk", onClk);
   Bridge.provide("dev", onDev);
+  Bridge.provide("cfg", onCfg);
   Bridge.provide("page", onPage);
   Bridge.provide("item", onItem);
   Bridge.notify("hello");       // Python answers with the full state
@@ -1695,6 +2273,7 @@ void setup() {
 
 void loop() {
   handleInput();
+  matrixStep();
 
   applyInbox();
 
@@ -1707,15 +2286,16 @@ void loop() {
   }
 
   if (idle) {
-    if (t - rainFrameAt >= 40) { rainFrameAt = t; rainFrame(); }
+    if (t - rainFrameAt >= RAIN_TICK_MS) { rainFrameAt = t; rainFrame(); }
     return;
   }
-  if (!playing && t - pausedSince >= IDLE_MS && t - lastInputAt >= IDLE_MS) { enterIdle(); return; }
+  if (idleMs && !playing && t - pausedSince >= idleMs && t - lastInputAt >= idleMs) { enterIdle(); return; }
 
   if (!inMenu && clockNow() != clockShown) headerClock();
   if (!inMenu) marqueeStep();
 
   if (inMenu && toastUntil && t > toastUntil) { toastUntil = 0; menuHint(); }
+  if (inMenu) menuBarStep();
 
   if (!inMenu && view != V_NOW && t - lastFrame >= FRAME_MS) {
     lastFrame = t;

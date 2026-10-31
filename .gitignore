@@ -19,3 +19,7 @@ tools/cdrom-modules/Module.symvers
 tools/cdrom-modules/modules.order
 tools/cdrom-modules/*.c
 tools/cdrom-modules/*.h
+
+# Settings menu values (written on the board)
+settings.json
+settings.json.tmp

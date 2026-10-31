@@ -12,12 +12,15 @@ whatever MPD is playing — CDs, FLAC/WAV files, CUE images or internet radio.
 
 **2.4" TFT + rotary encoder** (optional)
 - Now playing: artist, title, album, year, track, time, format (`FLAC 16/44`, `MP3 320`)
-- Three more views: a tape-deck spectrum, two VU meters, a 6E1P-style magic eye
+- Three more views: a 32-band tape-deck spectrum with peak hold, two VU meters, a
+  6E1P-style magic eye
 - Knob: volume; press: play/pause; hold: next track (repeats every second)
 - Menu: queue, artists, albums, internet radio, audio CD, the USB stick with CD rips
   (CD and USB are greyed out while the drive or the stick is not plugged in)
+- Settings menu: screen brightness, 16 or 32 spectrum bars, peaks that fade or
+  fall, when the rain starts, LED matrix brightness, sensitivity, start view
 - Latin and Cyrillic titles; long titles scroll back and forth
-- After a minute without playback: the "digital rain", with the time showing through it
+- After a minute without playback: the "digital rain"
 
 Everything runs on the board itself; it never affects playback — if the app
 stops, MPD keeps playing.
@@ -32,7 +35,7 @@ MPD ──► main audio output (DAC) ──► amplifier
          │                                             │
          ▼                                             │
    python/main.py + mpdui.py  (Linux side, App Lab container)
-   PCM → FFT → matrix frame, 16 bands, L/R levels      │
+   PCM → FFT → 13 + 16 band levels, L/R VU             │
    MPD idle → what is playing, volume, clock           │
          │  Bridge.notify(...)          ▲ Bridge.notify(vol / cmd / get / sel)
          ▼                              │
@@ -176,36 +179,55 @@ Any input wakes the screen from the digital rain without doing anything else.
 
 ## Tuning
 
-Analyzer settings are constants at the top of `python/main.py`:
+The everyday ones are in the **Settings** menu (press a row, turn to change it,
+press to keep, K0 to undo). Python saves them in `settings.json` in the app
+folder (not in git).
+
+Settings menu | Values
+---|---
+Brightness | 10–100 %
+Spectrum | 16 or 32 bars
+Peaks | fade in place or fall
+Rain after | never, 1, 2, 5, 10, 30 min without playback
+Matrix | LED matrix brightness 1–7
+Sensitivity | −36 … −60 dB: the level shown as an empty bar (further from 0 = taller bars)
+Start view | Now, Spectrum, VU, Eye, or the last one used
+Menu cursor | slides or fades between rows
+
+The rest are constants at the top of `python/main.py`:
 
 | Setting | Default | Effect |
 |---|---|---|
-| `FLOOR_DB` | `-48.0` | Sensitivity. Closer to 0 (e.g. `-42`) → lower bars; further (e.g. `-54`) → taller bars |
-| `FPS` | `25` | Frame rate |
-| `BAR_FALL` | `0.5` | How fast bars drop, rows per frame |
-| `PEAK_HOLD` | `12` | Frames a peak dot stays before falling |
-| `PEAK_FALL` | `0.15` | How fast peak dots drop, rows per frame |
-| `BAR_BRIGHT` | `7` | Bar brightness, 0..7 |
-| `PEAK_BRIGHT` | `4` | Peak dot brightness, 0..7 |
+| `FPS` | `25` | Analyses (lv messages) per second |
 | `VU_REF_DBFS` | `-18.0` | Level that reads 0 VU on the meters |
-| `PROFILE` | `False` | Print per-stage timings (read, FFT, render, bridge) every 5 s |
+| `PROFILE` | `False` | Print per-stage timings (read, FFT, bridge) every 5 s |
 
 `python/mpdui.py`: `TIMEZONE` (the container runs in UTC), `VOLUME_STEP`
 (percent per click, keep it equal to the sketch's).
 
-`sketch/sketch.ino`: `REVERSE` (knob direction), `STEPS_PER_DETENT`,
-`HOLD_MS` / `REPEAT_MS` (hold to skip), `IDLE_MS` (when the rain starts),
+`sketch/sketch.ino`: the LED matrix bars (`MAT_FALL` rows per second,
+`MAT_PEAK_HOLD_MS`, `MAT_PEAK_FALL`, `MAT_BAR_BRIGHT` / `MAT_PEAK_BRIGHT`
+0..7), `FRAME_MS` (TFT animation, 16 = ~60 fps), `FAST_SPI` /
+`FAST_SPI_DIV` (see below), `REVERSE` (knob direction), `STEPS_PER_DETENT`,
+`HOLD_MS` / `REPEAT_MS` (hold to skip),
 `MQ_PX` / `MQ_STEP_MS` / `MQ_HOLD_MS` (scrolling titles), `SHOW_MS` (redraw
 time in the corner).
 
 ## Notes on the display
 
-The SPI driver of the Zephyr core moves about 330 KB/s whatever the clock,
-so a full-screen redraw takes ~0.45 s. The sketch therefore never redraws
-more than it has to: only changed bar segments, needles and text, text
-rendered in RAM and sent as one block, and on a view change only what the
-old view drew is erased. Switching views takes 0.2–0.5 s; animations run at
-about 30 fps.
+The SPI driver of the Zephyr core works without DMA, with an interrupt per
+word, and moves only 300–500 KB/s whatever the clock: a full-screen redraw
+takes ~0.45 s. With `FAST_SPI` (the default) the sketch writes SPI2's
+registers itself while it draws, at 40 MHz, and gives the SPI back to the
+driver as it found it afterwards: a full screen then takes ~47 ms. Measure
+it on your board with `tools/spi-bench` (a separate App Lab app: copy the
+folder to `~/ArduinoApps/spi-bench`). If the picture shows garbage, set
+`FAST_SPI_DIV = 8` (20 MHz) or `FAST_SPI = false`.
+
+The sketch also never redraws more than it has to: only changed bar
+segments, needles and text, text rendered in RAM and sent as one block, and
+on a view change only what the old view drew is erased. Switching views
+takes ~35 ms; animations run at ~60 fps.
 
 ## Limitations
 
@@ -219,11 +241,13 @@ about 30 fps.
 ## Project layout
 
 ```
-python/main.py           audio capture, FFT, matrix frames, TFT levels
+python/main.py           audio capture, FFT, band levels for the matrix and the TFT
 python/mpdui.py          MPD client: now playing, knob and buttons, menu lists
 python/requirements.txt  Python dependencies (numpy, tzdata)
 sketch/sketch.ino        LED matrix, TFT screens, encoder and buttons
 sketch/font5x7*.h        5×7 pixel font: Latin (Adafruit), Cyrillic, rain glyphs
+tools/cdrom-modules/     builds the CD drivers the UNO Q kernel leaves out
+tools/spi-bench/         TFT fill speed: Zephyr's SPI driver vs. direct registers
 radio.txt                internet radio stations for the menu
 ```
 
