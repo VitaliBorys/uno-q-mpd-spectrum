@@ -77,7 +77,7 @@ const bool SPI16 = true;               // 16-bit SPI words for pixels (when FAST
 const bool FAST_SPI = true;            // write SPI2's registers directly, skipping Zephyr's driver
 const int FAST_SPI_DIV = 4;            // SPI clock = 160 MHz / this: 4 = 40 MHz, 8 = 20 MHz
 const bool STRIPS_RTL = true;          // strips right to left: the panel's refresh direction (tested)
-const bool MENU_BAR_FADE = true;       // menu cursor: fades between rows (true) or slides (false)
+const bool MENU_BAR_FADE = false;      // menu cursor: slides (false) or fades between rows (true)
 // Panel refresh (ST7789 FRCTRL2): 0x0F = 60 Hz, the default. 0x00 (119 Hz)
 // left this panel black with two stripes; 0x0F is not even sent.
 const uint8_t PANEL_FRCTRL2 = 0x0F;
