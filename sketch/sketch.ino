@@ -77,10 +77,9 @@ const bool SPI16 = true;               // 16-bit SPI words for pixels (when FAST
 const bool FAST_SPI = true;            // write SPI2's registers directly, skipping Zephyr's driver
 const int FAST_SPI_DIV = 4;            // SPI clock = 160 MHz / this: 4 = 40 MHz, 8 = 20 MHz
 const bool STRIPS_RTL = true;          // strips right to left: the panel's refresh direction (tested)
-// Panel refresh (ST7789 FRCTRL2): 0x0F = 60 Hz (the default), 0x00 = 119 Hz.
-// Faster, a frame that catches a write halfway (no TE line to time writes
-// to the refresh) is on screen for half as long.
-const uint8_t PANEL_FRCTRL2 = 0x00;
+// Panel refresh (ST7789 FRCTRL2): 0x0F = 60 Hz, the default. 0x00 (119 Hz)
+// left this panel black with two stripes; 0x0F is not even sent.
+const uint8_t PANEL_FRCTRL2 = 0x0F;
 const unsigned long IDLE_MS = 60000;   // no playback this long -> digital rain
 const int VOLUME_STEP = 2;             // percent per click (must match Python)
 // LED matrix spectrum (13 bands from Python; the bars are animated here)
@@ -1984,7 +1983,7 @@ void setup() {
   tft.setBacklight(255);
   tft.begin16(SPI16, 16000000);
   tft.setRotation(1);
-  tft.frameRate(PANEL_FRCTRL2);
+  if (PANEL_FRCTRL2 != 0x0F) tft.frameRate(PANEL_FRCTRL2);
   tft.beginFast(FAST_SPI);       // after the library's own setup commands
   tft.fillScreen(BLACK);
 
