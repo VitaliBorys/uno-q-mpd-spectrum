@@ -77,6 +77,7 @@ const bool SPI16 = true;               // 16-bit SPI words for pixels (when FAST
 const bool FAST_SPI = true;            // write SPI2's registers directly, skipping Zephyr's driver
 const int FAST_SPI_DIV = 4;            // SPI clock = 160 MHz / this: 4 = 40 MHz, 8 = 20 MHz
 const bool STRIPS_RTL = true;          // strips right to left: the panel's refresh direction (tested)
+const bool MENU_BAR_FADE = true;       // menu cursor: fades between rows (true) or slides (false)
 // Panel refresh (ST7789 FRCTRL2): 0x0F = 60 Hz, the default. 0x00 (119 Hz)
 // left this panel black with two stripes; 0x0F is not even sent.
 const uint8_t PANEL_FRCTRL2 = 0x0F;
@@ -1554,6 +1555,33 @@ int cursorY() { Level &l = st[depth]; return rowY(l.cursor - l.top); }
 // strips across all those rows at once, for the same reason as the
 // marquee: the panel refreshes column by column, and rows sent one after
 // another (each top to bottom) made the bar look cut along a diagonal.
+// Fading cursor (MENU_BAR_FADE): the bar doesn't move; the old row fades
+// out while the new one fades in, over FADE_STEPS frames. A frame the panel
+// catches halfway then shows two nearby shades, not the bar in two places.
+const int FADE_STEPS = 4;
+const unsigned long FADE_STEP_MS = 16;
+bool fadeOn = false;
+int fadeOld = -1, fadeNew = -1, fadeK = 0;     // list indexes, frame
+float fadeOldFrom = 1;                         // the old row's level when it began fading
+unsigned long fadeAt = 0;
+
+uint16_t mix565(uint16_t a, uint16_t b, float t) {
+  if (t <= 0) return a;
+  if (t >= 1) return b;
+  int ra = a >> 11, ga = (a >> 5) & 63, ba = a & 31, rb = b >> 11, gb = (b >> 5) & 63, bb = b & 31;
+  int rr = ra + (int)lroundf((rb - ra) * t), gg = ga + (int)lroundf((gb - ga) * t), b2 = ba + (int)lroundf((bb - ba) * t);
+  return (uint16_t)((rr << 11) | (gg << 5) | b2);
+}
+
+float barLevel(int idx) {
+  Level &l = st[depth];
+  if (!fadeOn) return idx == l.cursor ? 1 : 0;
+  float f = (float)fadeK / FADE_STEPS;
+  if (idx == fadeNew) return f;
+  if (idx == fadeOld) return fadeOldFrom * (1 - f);
+  return 0;
+}
+
 // The bar is dim on a root item whose device is missing.
 uint16_t barColorShown = 0;
 uint16_t barColor() {
@@ -1568,7 +1596,7 @@ void menuPaintArea(int i0, int i1, const int *ys, int nb, int xa, int xb) {
   Level &l = st[depth];
   int n = listCount(l);
   if (n <= 0) n = 1;                           // loading ("...") or empty ("(empty)"): one row
-  struct Slot { const uint8_t *gl[25]; int len; uint16_t fg; bool arrow, used; };
+  struct Slot { const uint8_t *gl[25]; int len; uint16_t fg, bfg, bbg; bool arrow, used, lit; };
   Slot sl[ROWS];
   const uint8_t *ar[1];
   decodeGlyphs(">", ar, 1);
@@ -1579,16 +1607,25 @@ void menuPaintArea(int i0, int i1, const int *ys, int nb, int xa, int xb) {
     Slot &q = sl[i];
     int idx = l.top + i;
     q.used = idx < n;
-    q.len = 0; q.arrow = false; q.fg = VFD;
+    q.len = 0; q.arrow = false; q.fg = VFD; q.lit = false;
+    bool off = l.id == L_ROOT && !rootAvailable(idx);
     if (q.used) {
       char b[64];
       listLabel(l, idx, b, sizeof(b));
-      bool off = l.id == L_ROOT && !rootAvailable(idx);
       q.fg = off ? LINE : VFD;
       q.len = imin(decodeGlyphs(b, q.gl, 25), (ROW_W - 12 - 18) / 12);
-      q.arrow = opensSubmenu(l) && !off && idx == l.cursor && barY == rowY(i);
+      q.arrow = opensSubmenu(l) && !off && idx == l.cursor &&
+                (MENU_BAR_FADE ? !fadeOn : barY == rowY(i));
     }
-    bool barHere = barY >= 0 && barY < rowY(i) + ROW_H && barY + ROW_H - 1 > rowY(i);
+    if (MENU_BAR_FADE) {                       // this row's share of the bar, 0..1
+      float lv = q.used ? barLevel(idx) : 0;
+      uint16_t c = off ? MUTED : VFD;
+      q.lit = lv > 0;
+      q.bbg = mix565(BLACK, c, lv);            // the bar fades in or out...
+      q.bfg = mix565(q.fg, BLACK, lv);         // ...and its text with it
+    }
+    bool barHere = MENU_BAR_FADE ? q.lit
+                 : barY >= 0 && barY < rowY(i) + ROW_H && barY + ROW_H - 1 > rowY(i);
     x1 = imax(x1, barHere || q.used ? ROW_W : 0);
     x1 = imax(x1, rowW[i]);                     // what was drawn there before goes
   }
@@ -1606,7 +1643,8 @@ void menuPaintArea(int i0, int i1, const int *ys, int nb, int xa, int xb) {
     for (int yy = y0; yy < y0 + h; yy++) {
       int i = (yy - ROW_Y0) / ROW_H, r = (yy - ROW_Y0) % ROW_H;
       Slot &q = sl[i];
-      bool inBar = barY >= 0 && yy >= barY && yy < barY + ROW_H - 1;
+      bool inBar = MENU_BAR_FADE ? q.lit && r < ROW_H - 1
+                                 : barY >= 0 && yy >= barY && yy < barY + ROW_H - 1;
       int gy = r - 2;
       bool inY = q.used && gy >= 0 && gy < 16;
       gy /= 2;
@@ -1618,7 +1656,8 @@ void menuPaintArea(int i0, int i1, const int *ys, int nb, int xa, int xb) {
           if (q.arrow && c >= ROW_W - 18 && c < ROW_W - 8) on = (ar[0][(c - (ROW_W - 18)) / 2] >> gy) & 1;
         }
         bool b2 = inBar && c >= 6;
-        *p++ = b2 ? (on ? BLACK : bar) : (on ? q.fg : BLACK);
+        if (MENU_BAR_FADE) *p++ = b2 ? (on ? q.bfg : q.bbg) : (on ? q.fg : BLACK);
+        else *p++ = b2 ? (on ? BLACK : bar) : (on ? q.fg : BLACK);
       }
     }
     tft.window(sx, y0, sx + w - 1, y0 + h - 1);
@@ -1649,6 +1688,7 @@ void menuScrollbar() {
 }
 
 void menuRows() {
+  fadeOn = false;
   barY = cursorY();                            // a full redraw ends any slide
   barTo = barY;
   menuPaint(0, ROWS - 1);
@@ -1804,7 +1844,39 @@ void barRedraw(int from) {
 // One frame of the cursor bar's slide; called from loop(). Half the
 // remaining way, between BAR_MIN_PX and BAR_MAX_PX (small steps: a torn
 // frame shows a small step), faster when it falls behind on a fast spin.
+void paintIdx(int idx) {
+  Level &l = st[depth];
+  if (idx >= l.top && idx < l.top + ROWS) menuRow(idx - l.top);
+}
+
+// The cursor moved from row `from` within the visible rows: start a fade.
+void fadeStart(int from) {
+  Level &l = st[depth];
+  int stale = -1;
+  float fromLevel = 1;
+  if (fadeOn) {                                // a fade still running: hurry it along
+    fromLevel = from == fadeNew ? (float)fadeK / FADE_STEPS : 0;
+    if (fadeOld != l.cursor) stale = fadeOld;  // that one goes dark at once
+  }
+  fadeOn = true;
+  fadeOld = from; fadeNew = l.cursor; fadeK = 1; fadeOldFrom = fromLevel;
+  fadeAt = millis();
+  if (stale >= 0 && stale != from) paintIdx(stale);
+  paintIdx(fadeOld);
+  paintIdx(fadeNew);
+}
+
+void fadeStep() {
+  unsigned long t = millis();
+  if (t - fadeAt < FADE_STEP_MS) return;
+  fadeAt = t;
+  if (++fadeK >= FADE_STEPS) fadeOn = false;   // the last frame also brings back the ">"
+  paintIdx(fadeOld);
+  paintIdx(fadeNew);
+}
+
 void menuBarStep() {
+  if (MENU_BAR_FADE) { if (fadeOn) fadeStep(); return; }
   if (barY == barTo) return;
   unsigned long t = millis();
   if (t - barStepAt < BAR_STEP_MS) return;
@@ -1823,6 +1895,7 @@ void menuMove(int d) {
   if (n <= 0) return;                          // still loading
   int c = imax(0, imin(n - 1, l.cursor + d));
   if (c == l.cursor) return;
+  int oldCursor = l.cursor;
   l.cursor = c;
   int top = l.top;                             // keep a row of context above and below
   if (c < top + 1) top = c - 1;
@@ -1835,6 +1908,8 @@ void menuMove(int d) {
     menuRows();                                // ~25 ms with FAST_SPI
     requestVisible(dir);
     showMs(millis() - t0);
+  } else if (MENU_BAR_FADE) {
+    fadeStart(oldCursor);
   } else {
     barTo = cursorY();                         // slide from wherever the bar is now
     barStepAt = 0;
