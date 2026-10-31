@@ -375,7 +375,6 @@ const uint16_t EYE_HUB = RGB(10, 14, 4);
 const uint16_t MX_HEAD = RGB(190, 255, 210);
 const uint16_t MX_MID = RGB(0, 150, 70);
 const uint16_t MX_DARK = RGB(0, 70, 32);
-const uint16_t MX_CLOCK = RGB(150, 255, 190);
 const uint16_t EYE_DOT = RGB(90, 140, 20);
 
 // ---- Layout --------------------------------------------------------------
@@ -441,15 +440,12 @@ uint32_t rng = 0x12345678;
 
 // Idle screen (digital rain)
 const int MX_COLS = 26, MX_ROWS = 15, MX_CW = 12, MX_CH = 16, MX_X0 = 4;
-const int CLOCK_EVERY_MS = 20000;
 bool idle = false;
 bool swallowRelease = false;
-unsigned long pausedSince = 0, lastInputAt = 0, rainFrameAt = 0, clockPhaseAt = 0;
-uint8_t clockPhase = 0;          // 0 rain only, 1 time appears, 2 time shown, 3 time dissolves
+unsigned long pausedSince = 0, lastInputAt = 0, rainFrameAt = 0;
 RainCol rain[MX_COLS];
 uint8_t mxGlyph[MX_ROWS][MX_COLS];
 uint8_t mxLevel[MX_ROWS][MX_COLS];   // 0 empty, 1 dark, 2 mid, 3 bright, 4 head
-uint8_t mxLock[MX_ROWS][MX_COLS];    // clock cells: 1 waiting for the rain, 2 lit
 
 // Text renderer buffer: one strip of pixels
 uint16_t pbuf[8192];
@@ -1108,9 +1104,7 @@ void eraseView(int v) {
 // ---- Idle screen: digital rain --------------------------------------------
 // Columns of glyphs fall at different speeds: a pale head, a bright glyph
 // behind it, then the trail fades through mid and dark green. Only the few
-// cells that change are redrawn each frame. Every 20 s the time appears out
-// of the rain: the cells that form the digits light up as the rain passes
-// over them, stay for a few seconds, then dissolve.
+// cells that change are redrawn each frame.
 int irand(int n) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng % n; }
 
 const uint8_t *rainGlyph(uint8_t id) {
@@ -1119,18 +1113,16 @@ const uint8_t *rainGlyph(uint8_t id) {
 
 void mxDraw(int r, int c) {
   int x = MX_X0 + c * MX_CW, y = r * MX_CH;
-  bool lit = mxLock[r][c] == 2;
   uint8_t lv = mxLevel[r][c];
-  if (!lit && lv == 0) { tft.fillRect(x, y, MX_CW, MX_CH, BLACK); return; }
-  if (clockPhase && !lit && lv > 2) lv = 2;      // while the time shows, the rain steps back
-  uint16_t fg = lit ? MX_CLOCK : lv == 4 ? MX_HEAD : lv == 3 ? VFD : lv == 2 ? MX_MID : MX_DARK;
+  if (lv == 0) { tft.fillRect(x, y, MX_CW, MX_CH, BLACK); return; }
+  uint16_t fg = lv == 4 ? MX_HEAD : lv == 3 ? VFD : lv == 2 ? MX_MID : MX_DARK;
   const uint8_t *g = rainGlyph(mxGlyph[r][c]);
   uint16_t *p = pbuf;
   for (int py = 0; py < MX_CH; py++)
     for (int px = 0; px < MX_CW; px++) {
       int gx = px / 2, gy = py / 2;
       bool on = gx < 5 && ((g[4 - gx] >> gy) & 1);    // mirrored, as in the film
-      *p++ = lit ? (on ? BLACK : MX_CLOCK) : (on ? fg : BLACK);   // clock cells: negative, so digits read as solid shapes
+      *p++ = on ? fg : BLACK;
     }
   tft.startWrite();
   tft.window(x, y, x + MX_CW - 1, y + MX_CH - 1);
@@ -1140,10 +1132,7 @@ void mxDraw(int r, int c) {
 
 void mxSet(int r, int c, uint8_t lv) {
   if (r < 0 || r >= MX_ROWS) return;
-  if (lv == 4) {
-    mxGlyph[r][c] = irand(KANA_COUNT + 10);
-    if (mxLock[r][c] == 1) mxLock[r][c] = 2;      // the rain "writes" the clock
-  }
+  if (lv == 4) mxGlyph[r][c] = irand(KANA_COUNT + 10);
   if (mxLevel[r][c] == lv && lv != 4) return;
   mxLevel[r][c] = lv;
   mxDraw(r, c);
@@ -1167,60 +1156,16 @@ void rainStep(int c) {
   if (h - k.len >= MX_ROWS) rainReset(c, false);
 }
 
-// Big digits, 3x5 cells each
-const uint8_t BIG_DIGITS[10][5] = {
-  {7, 5, 5, 5, 7}, {2, 6, 2, 2, 7}, {7, 1, 7, 4, 7}, {7, 1, 7, 1, 7}, {5, 5, 7, 1, 1},
-  {7, 4, 7, 1, 7}, {7, 4, 7, 5, 7}, {7, 1, 1, 1, 1}, {7, 5, 7, 5, 7}, {7, 5, 7, 1, 7},
-};
-
-void clockTargets() {
-  int m = clockNow();
-  if (m < 0) return;
-  int d[4] = {m / 600, m / 60 % 10, m % 60 / 10, m % 10};
-  int x0[4] = {4, 8, 14, 18};
-  const int top = 5;
-  for (int i = 0; i < 4; i++)
-    for (int r = 0; r < 5; r++)
-      for (int b = 0; b < 3; b++)
-        if (BIG_DIGITS[d[i]][r] & (4 >> b)) mxLock[top + r][x0[i] + b] = 1;
-  mxLock[top + 1][12] = mxLock[top + 3][12] = 1;   // colon
-}
-
-void clockUpdate() {
-  unsigned long t = millis() - clockPhaseAt;
-  if (clockPhase == 0 && t >= CLOCK_EVERY_MS) {
-    clockTargets();
-    clockPhase = 1; clockPhaseAt = millis();
-  } else if (clockPhase == 1 && t >= 1500) {         // light whatever the rain missed
-    for (int r = 0; r < MX_ROWS; r++)
-      for (int c = 0; c < MX_COLS; c++)
-        if (mxLock[r][c] == 1) { mxLock[r][c] = 2; mxGlyph[r][c] = irand(KANA_COUNT + 10); mxDraw(r, c); }
-    clockPhase = 2; clockPhaseAt = millis();
-  } else if (clockPhase == 2 && t >= 3500) {
-    clockPhase = 3; clockPhaseAt = millis();
-  } else if (clockPhase == 3) {                       // dissolve over ~1 s
-    int left = 0;
-    for (int r = 0; r < MX_ROWS; r++)
-      for (int c = 0; c < MX_COLS; c++)
-        if (mxLock[r][c]) {
-          if (irand(100) < 12) { mxLock[r][c] = 0; mxLevel[r][c] = 0; mxDraw(r, c); }
-          else left++;
-        }
-    if (!left) { clockPhase = 0; clockPhaseAt = millis(); }
-  }
-}
-
 void rainFrame() {
   for (int c = 0; c < MX_COLS; c++)
     if (++rain[c].phase >= rain[c].period) { rain[c].phase = 0; rainStep(c); }
   for (int i = 0; i < 3; i++) {                       // glyphs flicker in the trails
     int r = irand(MX_ROWS), c = irand(MX_COLS);
-    if (!mxLock[r][c] && (mxLevel[r][c] == 2 || mxLevel[r][c] == 3)) {
+    if (mxLevel[r][c] == 2 || mxLevel[r][c] == 3) {
       mxGlyph[r][c] = irand(KANA_COUNT + 10);
       mxDraw(r, c);
     }
   }
-  clockUpdate();
 }
 
 void enterIdle() {
@@ -1228,10 +1173,7 @@ void enterIdle() {
   mq.on = false;
   inMenu = false;
   memset(mxLevel, 0, sizeof(mxLevel));
-  memset(mxLock, 0, sizeof(mxLock));
   for (int c = 0; c < MX_COLS; c++) rainReset(c, true);
-  clockPhase = 0;
-  clockPhaseAt = millis() - (CLOCK_EVERY_MS - 8000);   // first time after ~8 s
   tft.fillScreen(BLACK);
 }
 

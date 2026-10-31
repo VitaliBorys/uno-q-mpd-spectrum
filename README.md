@@ -17,7 +17,7 @@ whatever MPD is playing — CDs, FLAC/WAV files, CUE images or internet radio.
 - Menu: queue, artists, albums, internet radio, audio CD, the USB stick with CD rips
   (CD and USB are greyed out while the drive or the stick is not plugged in)
 - Latin and Cyrillic titles; long titles scroll back and forth
-- After a minute without playback: the "digital rain", with the time showing through it
+- After a minute without playback: the "digital rain"
 
 Everything runs on the board itself; it never affects playback — if the app
 stops, MPD keeps playing.
