@@ -6,6 +6,8 @@ MPD side of the physical controller (TFT + knob + buttons on the MCU).
     st(state, elapsed, volume, repeat, random, song)
     clk(minutes since midnight)
     dev(mask)     CD drive (1) and USB stick (2) present
+    cfg(bytes)    the settings (index of each value) and the last view
+  and stores what the Settings menu changes: set(key, index)
 - Turns knob and button events from the MCU into MPD commands:
     vol(clicks)   cmd(code)   hello()
 - Serves the menu one page at a time:
@@ -20,6 +22,7 @@ Bridge callbacks never wait for MPD: events go to a queue and a worker
 thread talks to MPD, so a slow or restarting MPD can't stall the Bridge.
 """
 
+import json
 import os
 import queue
 import re
@@ -37,6 +40,7 @@ except ImportError:          # very old Python
 TIMEZONE = "Europe/Warsaw"   # the container runs in UTC; the clock shows local time
 VOLUME_STEP = 2              # percent per knob click (must match the sketch)
 RADIO_FILE = "/app/radio.txt"
+SETTINGS_FILE = "/app/settings.json"   # written by the Settings menu (not in git)
 REFRESH_S = 5                # re-send the status this often while playing
 CD_CACHE_S = 5               # how long a probe of the disc stays valid
 DEV_POLL_S = 2               # how often to look for the CD drive and the USB stick
@@ -214,6 +218,63 @@ class Library:
         print(f"[mpdui] library: {len(self.artists)} artists, {len(self.albums)} albums")
 
 
+# Settings, in the order of the sketch's S_* enum: (name, number of values,
+# default index). The sketch shows them; Python stores them and applies
+# sensitivity (FLOOR_DB = -(36 + 3 * index)).
+SETTINGS = [("brightness", 10, 9), ("spectrum", 2, 1), ("peaks", 2, 0), ("rain", 6, 1),
+            ("matrix", 7, 6), ("sensitivity", 9, 4), ("start_view", 5, 0), ("menu_cursor", 2, 0)]
+S_SENS = 5
+S_LAST_VIEW = 100
+
+
+class Settings:
+    """settings.json: {"brightness": 9, ..., "last_view": 0}, indexes as the sketch uses them."""
+
+    def __init__(self, path=SETTINGS_FILE):
+        self.path = path
+        self.values = [d for _, _, d in SETTINGS]
+        self.last_view = -1
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            for i, (name, n, _) in enumerate(SETTINGS):
+                v = data.get(name)
+                if isinstance(v, int) and 0 <= v < n:
+                    self.values[i] = v
+            if data.get("last_view") in (0, 1, 2, 3):
+                self.last_view = data["last_view"]
+        except (OSError, ValueError, AttributeError):
+            pass                     # no file yet, or a broken one: defaults
+
+    def floor_db(self):
+        return -(36.0 + 3 * self.values[S_SENS])
+
+    def set(self, key, value):
+        if key == S_LAST_VIEW:
+            if value not in (0, 1, 2, 3) or value == self.last_view:
+                return
+            self.last_view = value
+        elif 0 <= key < len(SETTINGS) and 0 <= value < SETTINGS[key][1]:
+            self.values[key] = value
+        else:
+            return
+        self.save()
+
+    def save(self):
+        data = {name: self.values[i] for i, (name, _, _) in enumerate(SETTINGS)}
+        data["last_view"] = self.last_view
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=1)
+            os.replace(tmp, self.path)       # a power cut leaves the old file, not half a new one
+        except OSError as exc:
+            print(f"[mpdui] settings: {exc}")
+
+    def cfg(self):
+        return bytes(self.values + [self.last_view if self.last_view >= 0 else 255])
+
+
 def load_radio(path=RADIO_FILE):
     """radio.txt: one station per line, "Name | URL". Returns {url: name}
     in file order."""
@@ -387,6 +448,7 @@ class Controller:
     def __init__(self, send):
         self.send = send             # send(name, *args), thread-safe
         self.radio = load_radio()
+        self.settings = Settings()
         self.library = Library()
         self.cue_codecs = {}         # CUE sheet path -> codec of its audio file
         self.cd_count = 0            # audio tracks on the disc (see _cd_tracks)
@@ -408,6 +470,12 @@ class Controller:
 
     def on_cmd(self, code):
         self.events.put(("cmd", int(code)))
+
+    def on_set(self, key, value):
+        self.events.put(("set", (int(key), int(value))))
+
+    def floor_db(self):
+        return self.settings.floor_db()
 
     def on_hello(self):
         self.events.put(("hello", 0))
@@ -537,8 +605,11 @@ class Controller:
                     self._volume(value)
                 elif kind == "cmd":
                     self._command(value)
+                elif kind == "set":
+                    self.settings.set(*value)
                 elif kind == "hello":
                     self.radio = load_radio()
+                    self.send("cfg", self.settings.cfg())
                     self.push(force=True)
                     self.push_clock(force=True)
                     self.push_devices(force=True)

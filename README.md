@@ -17,6 +17,8 @@ whatever MPD is playing — CDs, FLAC/WAV files, CUE images or internet radio.
 - Knob: volume; press: play/pause; hold: next track (repeats every second)
 - Menu: queue, artists, albums, internet radio, audio CD, the USB stick with CD rips
   (CD and USB are greyed out while the drive or the stick is not plugged in)
+- Settings menu: screen brightness, 16 or 32 spectrum bars, peaks that fade or
+  fall, when the rain starts, LED matrix brightness, sensitivity, start view
 - Latin and Cyrillic titles; long titles scroll back and forth
 - After a minute without playback: the "digital rain"
 
@@ -177,11 +179,25 @@ Any input wakes the screen from the digital rain without doing anything else.
 
 ## Tuning
 
-Analyzer settings are constants at the top of `python/main.py`:
+The everyday ones are in the **Settings** menu (press a row, turn to change it,
+press to keep, K0 to undo). Python saves them in `settings.json` in the app
+folder (not in git).
+
+Settings menu | Values
+---|---
+Brightness | 10–100 %
+Spectrum | 16 or 32 bars
+Peaks | fade in place or fall
+Rain after | never, 1, 2, 5, 10, 30 min without playback
+Matrix | LED matrix brightness 1–7
+Sensitivity | −36 … −60 dB: the level shown as an empty bar (further from 0 = taller bars)
+Start view | Now, Spectrum, VU, Eye, or the last one used
+Menu cursor | slides or fades between rows
+
+The rest are constants at the top of `python/main.py`:
 
 | Setting | Default | Effect |
 |---|---|---|
-| `FLOOR_DB` | `-48.0` | Sensitivity. Closer to 0 (e.g. `-42`) → lower bars; further (e.g. `-54`) → taller bars |
 | `FPS` | `25` | Analyses (lv messages) per second |
 | `VU_REF_DBFS` | `-18.0` | Level that reads 0 VU on the meters |
 | `PROFILE` | `False` | Print per-stage timings (read, FFT, bridge) every 5 s |
@@ -193,7 +209,7 @@ Analyzer settings are constants at the top of `python/main.py`:
 `MAT_PEAK_HOLD_MS`, `MAT_PEAK_FALL`, `MAT_BAR_BRIGHT` / `MAT_PEAK_BRIGHT`
 0..7), `FRAME_MS` (TFT animation, 16 = ~60 fps), `FAST_SPI` /
 `FAST_SPI_DIV` (see below), `REVERSE` (knob direction), `STEPS_PER_DETENT`,
-`HOLD_MS` / `REPEAT_MS` (hold to skip), `IDLE_MS` (when the rain starts),
+`HOLD_MS` / `REPEAT_MS` (hold to skip),
 `MQ_PX` / `MQ_STEP_MS` / `MQ_HOLD_MS` (scrolling titles), `SHOW_MS` (redraw
 time in the corner).
 

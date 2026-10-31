@@ -27,7 +27,8 @@ N_LO = 4096                  # a longer FFT (~93 ms) for the TFT's bass bands
 # --- Analyzer --------------------------------------------------------------
 COLS = 13                    # LED matrix bands (the matrix is 8 x 13)
 FPS = 25                     # analyses per second
-FLOOR_DB = -48.0             # level shown as an empty bar (closer to 0 = less sensitive)
+# Sensitivity (the level shown as an empty bar) is in the Settings menu:
+# -36 .. -60 dB, closer to 0 = less sensitive. Stored in settings.json.
 # Bar fall, peak hold and brightness of the matrix are in sketch.ino (MAT_*).
 
 PROFILE = False              # print per-stage timings to the Python Shell every 5 s
@@ -141,7 +142,8 @@ def read_audio():
 
 
 def spectrum():
-    """Matrix and TFT band levels, 0..1 (FLOOR_DB..0 dB)."""
+    """Matrix and TFT band levels, 0..1 (the sensitivity setting .. 0 dB)."""
+    floor = controller.floor_db()
     spec = np.abs(np.fft.rfft(buf[-N:] * window)) / norm
     spec_lo = np.abs(np.fft.rfft(buf * window_lo)) / norm_lo
     db = 20 * np.log10(spec[band_idx].max(axis=1) + 1e-9)
@@ -150,8 +152,8 @@ def spectrum():
         sp, f = (spec_lo, freqs_lo) if use_lo else (spec, freqs)
         tft[b] = sp[idx].max() if idx is not None else np.interp(centre, f, sp)
     db_tft = 20 * np.log10(tft + 1e-9)
-    return (np.clip((db - FLOOR_DB) / -FLOOR_DB, 0, 1),
-            np.clip((db_tft - FLOOR_DB) / -FLOOR_DB, 0, 1))
+    return (np.clip((db - floor) / -floor, 0, 1),
+            np.clip((db_tft - floor) / -floor, 0, 1))
 
 
 def vu_position(rms):
@@ -201,5 +203,6 @@ Bridge.provide("cmd", controller.on_cmd)
 Bridge.provide("hello", controller.on_hello)
 Bridge.provide("get", controller.on_get)
 Bridge.provide("sel", controller.on_sel)
+Bridge.provide("set", controller.on_set)
 
 App.run(user_loop=loop)
