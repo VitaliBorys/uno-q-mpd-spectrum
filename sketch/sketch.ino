@@ -77,6 +77,10 @@ const bool SPI16 = true;               // 16-bit SPI words for pixels (when FAST
 const bool FAST_SPI = true;            // write SPI2's registers directly, skipping Zephyr's driver
 const int FAST_SPI_DIV = 4;            // SPI clock = 160 MHz / this: 4 = 40 MHz, 8 = 20 MHz
 const bool STRIPS_RTL = true;          // strips right to left: the panel's refresh direction (tested)
+// Panel refresh (ST7789 FRCTRL2): 0x0F = 60 Hz (the default), 0x00 = 119 Hz.
+// Faster, a frame that catches a write halfway (no TE line to time writes
+// to the refresh) is on screen for half as long.
+const uint8_t PANEL_FRCTRL2 = 0x00;
 const unsigned long IDLE_MS = 60000;   // no playback this long -> digital rain
 const int VOLUME_STEP = 2;             // percent per click (must match Python)
 // LED matrix spectrum (13 bands from Python; the bars are animated here)
@@ -184,6 +188,10 @@ public:
   using DIYables_ST7789_SPI::DIYables_ST7789_SPI;
   bool spi16 = false;
   bool fast = false;
+
+  void frameRate(uint8_t frctrl2) {             // through the driver, before beginFast()
+    startWrite(); writeCommand(0xC6); writeData8(frctrl2); endWrite();
+  }
 
   // After begin() and setRotation(): from here on drawing bypasses the driver.
   void beginFast(bool enable) {
@@ -1526,7 +1534,7 @@ bool rootAvailable(int i) {
 // write then shows the bar off by a few pixels at a seam, not by a whole
 // row. (The list itself only moves when it scrolls; the bar is what tears.)
 const unsigned long BAR_STEP_MS = 16;
-const int BAR_MAX_PX = 7, BAR_MIN_PX = 2;
+const int BAR_MAX_PX = 4, BAR_MIN_PX = 2;
 
 void menuHeader() {
   Level &l = st[depth];
@@ -1795,8 +1803,8 @@ void barRedraw(int from) {
 }
 
 // One frame of the cursor bar's slide; called from loop(). Half the
-// remaining way, between BAR_MIN_PX and BAR_MAX_PX: eases out, and on a
-// fast spin it keeps up at ~420 px/s (20 rows a second).
+// remaining way, between BAR_MIN_PX and BAR_MAX_PX (small steps: a torn
+// frame shows a small step), faster when it falls behind on a fast spin.
 void menuBarStep() {
   if (barY == barTo) return;
   unsigned long t = millis();
@@ -1804,6 +1812,7 @@ void menuBarStep() {
   barStepAt = t;
   int d = barTo - barY, a = abs(d);
   int step = imin(a, imax(BAR_MIN_PX, imin(BAR_MAX_PX, a / 2)));
+  if (a > 2 * ROW_H) step = a / 3;             // far behind on a fast spin: catch up
   int from = barY;
   barY += d > 0 ? step : -step;
   barRedraw(from);
@@ -1975,6 +1984,7 @@ void setup() {
   tft.setBacklight(255);
   tft.begin16(SPI16, 16000000);
   tft.setRotation(1);
+  tft.frameRate(PANEL_FRCTRL2);
   tft.beginFast(FAST_SPI);       // after the library's own setup commands
   tft.fillScreen(BLACK);
 
