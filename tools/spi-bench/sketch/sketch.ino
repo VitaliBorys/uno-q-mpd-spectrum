@@ -27,21 +27,11 @@
 
 const uint32_t LIB_FREQ = 16000000;          // what the spectrum sketch asks for
 
-// ---- SPI2 registers (STM32U5 reference manual, SPI chapter) ---------------
-const uint32_t SPI2_BASE = 0x40003800;
-#define REG(off) (*(volatile uint32_t *)(SPI2_BASE + (off)))
-#define SPI_CR1   REG(0x00)
-#define SPI_CR2   REG(0x04)
-#define SPI_CFG1  REG(0x08)
-#define SPI_CFG2  REG(0x0C)
-#define SPI_IER   REG(0x10)
-#define SPI_SR    REG(0x14)
-#define SPI_IFCR  REG(0x18)
-#define SPI_TXDR8  (*(volatile uint8_t *)(SPI2_BASE + 0x20))
-#define SPI_TXDR16 (*(volatile uint16_t *)(SPI2_BASE + 0x20))
-
-const uint32_t CR1_SPE = 1u << 0, CR1_CSTART = 1u << 9;
-const uint32_t SR_TXP = 1u << 1, SR_TXC = 1u << 12;
+// ---- SPI2 registers --------------------------------------------------------
+// The core already pulls in ST's CMSIS header for the STM32U585, so SPI2 is
+// the register block (SPI_TypeDef) and the bit names come from there too.
+#define SPI_TXDR8  (*(volatile uint8_t *)&SPI2->TXDR)
+#define SPI_TXDR16 (*(volatile uint16_t *)&SPI2->TXDR)
 const uint32_t IFCR_ALL = 0x0BF8;          // EOT, TXTF, UDR, OVR, CRCE, TIFRE, MODF, SUSP
 
 class BenchTFT : public DIYables_ST7789_SPI {
@@ -111,39 +101,39 @@ uint32_t lastMbr = 0;
 void fillRaw(int set, int bits, int mbr) {
   tft.startWrite();                     // Zephyr sets up SPI2 for LIB_FREQ
   tft.window();                         // CS low, DC high
-  uint32_t cfg1 = SPI_CFG1, cfg2 = SPI_CFG2, ier = SPI_IER;
-  SPI_CR1 &= ~CR1_SPE;                  // config registers only change while off
-  SPI_IER = 0;                          // keep Zephyr's interrupt handler out
-  uint32_t c1 = cfg1 & ~(0x1Fu | (0xFu << 5));                 // DSIZE, FTHLV
+  uint32_t cfg1 = SPI2->CFG1, cfg2 = SPI2->CFG2, ier = SPI2->IER;
+  SPI2->CR1 &= ~SPI_CR1_SPE;            // config registers only change while off
+  SPI2->IER = 0;                        // keep Zephyr's interrupt handler out
+  uint32_t c1 = cfg1 & ~(SPI_CFG1_DSIZE | SPI_CFG1_FTHLV);
   c1 |= (uint32_t)(bits - 1);
-  if (mbr >= 0) c1 = (c1 & ~(7u << 28)) | ((uint32_t)mbr << 28);
-  lastMbr = (c1 >> 28) & 7;
-  SPI_CFG1 = c1;
-  SPI_CFG2 = (cfg2 & ~(3u << 17)) | (1u << 17);                // COMM = transmit only
-  SPI_CR2 = 0;                          // TSIZE = 0: no fixed length
-  SPI_IFCR = IFCR_ALL;
-  SPI_CR1 |= CR1_SPE;
-  SPI_CR1 |= CR1_CSTART;
+  if (mbr >= 0) c1 = (c1 & ~SPI_CFG1_MBR) | ((uint32_t)mbr << SPI_CFG1_MBR_Pos);
+  lastMbr = (c1 & SPI_CFG1_MBR) >> SPI_CFG1_MBR_Pos;
+  SPI2->CFG1 = c1;
+  SPI2->CFG2 = (cfg2 & ~SPI_CFG2_COMM) | SPI_CFG2_COMM_0;      // transmit only
+  SPI2->CR2 = 0;                        // TSIZE = 0: no fixed length
+  SPI2->IFCR = IFCR_ALL;
+  SPI2->CR1 |= SPI_CR1_SPE;
+  SPI2->CR1 |= SPI_CR1_CSTART;
   for (int done = 0; done < W * H; done += CHUNK) {
     int n = min(CHUNK, W * H - done);
     fillBuf(done, n, set);
     if (bits == 16) {
-      for (int i = 0; i < n; i++) { while (!(SPI_SR & SR_TXP)) {} SPI_TXDR16 = buf[i]; }
+      for (int i = 0; i < n; i++) { while (!(SPI2->SR & SPI_SR_TXP)) {} SPI_TXDR16 = buf[i]; }
     } else {
       for (int i = 0; i < n; i++) {
         uint16_t v = buf[i];
-        while (!(SPI_SR & SR_TXP)) {} SPI_TXDR8 = v >> 8;
-        while (!(SPI_SR & SR_TXP)) {} SPI_TXDR8 = v & 0xFF;
+        while (!(SPI2->SR & SPI_SR_TXP)) {} SPI_TXDR8 = v >> 8;
+        while (!(SPI2->SR & SPI_SR_TXP)) {} SPI_TXDR8 = v & 0xFF;
       }
     }
   }
   uint32_t t0 = micros();
-  while (!(SPI_SR & SR_TXC) && micros() - t0 < 10000) {}       // last bits out
-  SPI_CR1 &= ~CR1_SPE;
-  SPI_IFCR = IFCR_ALL;
-  SPI_CFG1 = cfg1;                      // give SPI2 back to Zephyr as it was
-  SPI_CFG2 = cfg2;
-  SPI_IER = ier;
+  while (!(SPI2->SR & SPI_SR_TXC) && micros() - t0 < 10000) {}       // last bits out
+  SPI2->CR1 &= ~SPI_CR1_SPE;
+  SPI2->IFCR = IFCR_ALL;
+  SPI2->CFG1 = cfg1;                      // give SPI2 back to Zephyr as it was
+  SPI2->CFG2 = cfg2;
+  SPI2->IER = ier;
   tft.endWrite();
 }
 
