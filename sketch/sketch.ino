@@ -2137,7 +2137,7 @@ void menuSelect() {
     default:                                   // queue, albums, radio: play it
       if (listCount(l) <= 0) break;
       Bridge.notify("sel", (int)l.id, l.ctx, i, 0);
-      menuExit(V_NOW);
+      menuExit(-1);                          // back to the view the menu was opened from
       break;
   }
 }
