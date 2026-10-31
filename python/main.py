@@ -26,7 +26,7 @@ N_LO = 4096                  # a longer FFT (~93 ms) for the TFT's bass bands
 
 # --- Analyzer --------------------------------------------------------------
 COLS = 13                    # LED matrix bands (the matrix is 8 x 13)
-FPS = 25                     # analyses per second
+FPS = 50                     # analyses per second
 # Sensitivity (the level shown as an empty bar) is in the Settings menu:
 # -36 .. -60 dB, closer to 0 = less sensitive. Stored in settings.json.
 # Bar fall, peak hold and brightness of the matrix are in sketch.ino (MAT_*).
@@ -71,12 +71,29 @@ band_idx = np.array([np.pad(b, (0, maxlen - len(b)), mode="edge") for b in bands
 # between the two nearest bins, so neighbouring bars differ smoothly.
 freqs_lo = np.fft.rfftfreq(N_LO, 1 / RATE)
 tft_edges = np.geomspace(31, 16000, TFT_BANDS + 1)
-tft_plan = []                # per band: (use the N_LO FFT, bin indexes or None, centre Hz)
-for lo, hi in zip(tft_edges[:-1], tft_edges[1:]):
-    use_lo = np.sqrt(lo * hi) < TFT_LO_HZ
-    f = freqs_lo if use_lo else freqs
+# Precomputed so a frame is a few numpy calls, not one per band: both
+# spectra go into one array (the N_LO one first); a wide band takes the max
+# over its bins (padded with its last bin), a narrow one interpolates
+# between two bins: a * (1 - w) + b * w.
+_wide_rows, _wide_bands, _narrow = [], [], []
+for b, (lo, hi) in enumerate(zip(tft_edges[:-1], tft_edges[1:])):
+    centre = np.sqrt(lo * hi)
+    use_lo = centre < TFT_LO_HZ
+    f, base = (freqs_lo, 0) if use_lo else (freqs, len(freqs_lo))
     idx = np.where((f >= lo) & (f < hi))[0]
-    tft_plan.append((use_lo, idx if len(idx) >= 2 else None, np.sqrt(lo * hi)))
+    if len(idx) >= 2:
+        _wide_bands.append(b)
+        _wide_rows.append(idx + base)
+    else:
+        i = int(np.clip(np.searchsorted(f, centre) - 1, 0, len(f) - 2))
+        w = float(np.clip((centre - f[i]) / (f[i + 1] - f[i]), 0, 1))
+        _narrow.append((b, i + base, w))
+_wl = max(len(x) for x in _wide_rows)
+tft_wide_idx = np.array([np.pad(x, (0, _wl - len(x)), mode="edge") for x in _wide_rows])
+tft_wide_bands = np.array(_wide_bands)
+tft_narrow_bands = np.array([b for b, _, _ in _narrow], dtype=int)
+tft_narrow_i = np.array([i for _, i, _ in _narrow], dtype=int)
+tft_narrow_w = np.array([w for _, _, w in _narrow], dtype=np.float32)
 
 last_data = 0.0              # time of the last audio received
 rms_lr = np.zeros(2)         # left/right RMS of the latest audio, 0..1
@@ -147,10 +164,11 @@ def spectrum():
     spec = np.abs(np.fft.rfft(buf[-N:] * window)) / norm
     spec_lo = np.abs(np.fft.rfft(buf * window_lo)) / norm_lo
     db = 20 * np.log10(spec[band_idx].max(axis=1) + 1e-9)
-    tft = np.empty(TFT_BANDS)
-    for b, (use_lo, idx, centre) in enumerate(tft_plan):
-        sp, f = (spec_lo, freqs_lo) if use_lo else (spec, freqs)
-        tft[b] = sp[idx].max() if idx is not None else np.interp(centre, f, sp)
+    both = np.concatenate((spec_lo, spec))
+    tft = np.empty(TFT_BANDS, dtype=np.float32)
+    tft[tft_wide_bands] = both[tft_wide_idx].max(axis=1)
+    a, b = both[tft_narrow_i], both[tft_narrow_i + 1]
+    tft[tft_narrow_bands] = a + (b - a) * tft_narrow_w
     db_tft = 20 * np.log10(tft + 1e-9)
     return (np.clip((db - floor) / -floor, 0, 1),
             np.clip((db_tft - floor) / -floor, 0, 1))
