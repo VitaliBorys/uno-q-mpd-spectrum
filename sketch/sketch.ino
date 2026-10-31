@@ -76,7 +76,7 @@ const bool SHOW_MS = true;             // redraw time in the corner
 const bool SPI16 = true;               // 16-bit SPI words for pixels (when FAST_SPI is off)
 const bool FAST_SPI = true;            // write SPI2's registers directly, skipping Zephyr's driver
 const int FAST_SPI_DIV = 4;            // SPI clock = 160 MHz / this: 4 = 40 MHz, 8 = 20 MHz
-const bool MENU_STRIPS_RTL = false;    // menu strips right to left (to match the panel's refresh)
+const bool STRIPS_RTL = true;          // strips right to left: the panel's refresh direction (tested)
 const unsigned long IDLE_MS = 60000;   // no playback this long -> digital rain
 const int VOLUME_STEP = 2;             // percent per click (must match Python)
 // LED matrix spectrum (13 bands from Python; the bars are animated here)
@@ -436,9 +436,9 @@ int rowIdx[ROW_CACHE];           // which list index a slot holds, -1 = none
 int reqStart[4];                 // pages asked for recently (start index)...
 unsigned long reqAt[4];          // ...and when, so they aren't asked for again
 uint8_t reqNext = 0;
-// Cursor bar sliding between rows: from barFrom to barTo (pixel y), drawn at barY.
-int barY = -1, barFrom = 0, barTo = 0;
-unsigned long barAt = 0, barStepAt = 0;
+// Cursor bar sliding between rows: drawn at barY (pixel y), heading for barTo.
+int barY = -1, barTo = 0;
+unsigned long barStepAt = 0;
 Arduino_LED_Matrix matrix;
 int view = V_NOW;
 bool inMenu = false;
@@ -1050,11 +1050,12 @@ void takeLevels() {
 // Stands 2 s at each end, moves 1 px every 20 ms (~50 px/s). One step
 // redraws just the glyph rows of the title.
 //
-// Drawn in vertical strips, left to right. The panel is a portrait one
+// Drawn in vertical strips, right to left. The panel is a portrait one
 // turned on its side, so it refreshes our picture column by column. A box
 // sent row by row (top to bottom) would cross that refresh: the top of the
 // letters already moved, the bottom not yet - a comb through the text.
-// Strips sent along the refresh direction leave at most one vertical seam.
+// Strips sent along the refresh direction (right to left, found by trying
+// both on the menu) leave at most one vertical seam.
 const unsigned long MQ_HOLD_MS = 2000, MQ_STEP_MS = 20;
 const int MQ_PX = 1;                     // 1 px every 20 ms: the same ~50 px/s, smoother
 Marquee mq;
@@ -1096,7 +1097,9 @@ void marqueeDraw() {
   const uint8_t *gl[72];
   int len = decodeGlyphs(now.title, gl, 72);
   const int SW = 8;                            // strip width, px
-  for (int sx = 0; sx < mq.w; sx += SW) {
+  int strips = (mq.w + SW - 1) / SW;
+  for (int k = 0; k < strips; k++) {
+    int sx = (STRIPS_RTL ? strips - 1 - k : k) * SW;
     int sw = imin(SW, mq.w - sx);
     uint16_t *p = pbuf;
     for (int r = 0; r < mq.h; r++) {
@@ -1519,10 +1522,11 @@ bool rootAvailable(int i) {
 // below the cursor; press + turn still jumps a page. Rows come from Python
 // a page (8) at a time into a small cache, and the next page is asked for
 // before the cursor gets there. The cursor bar slides between rows.
-const int BAR_STEPS = 4;                       // frames for one slide
+// The bar moves at most BAR_MAX_PX a frame: a frame the panel catches mid-
+// write then shows the bar off by a few pixels at a seam, not by a whole
+// row. (The list itself only moves when it scrolls; the bar is what tears.)
 const unsigned long BAR_STEP_MS = 16;
-const unsigned long BAR_FAST_MS = 150;         // clicks closer than this: no slide
-unsigned long lastMoveAt = 0;
+const int BAR_MAX_PX = 7, BAR_MIN_PX = 2;
 
 void menuHeader() {
   Level &l = st[depth];
@@ -1577,7 +1581,7 @@ void menuPaint(int i0, int i1) {
   int strips = (x1 + SW - 1) / SW;
   tft.startWrite();
   for (int k = 0; k < strips; k++) {
-    int sx = (MENU_STRIPS_RTL ? strips - 1 - k : k) * SW;
+    int sx = (STRIPS_RTL ? strips - 1 - k : k) * SW;
     int w = imin(SW, x1 - sx);
     uint16_t *p = pbuf;
     for (int yy = y0; yy < y0 + h; yy++) {
@@ -1620,7 +1624,7 @@ void menuScrollbar() {
 
 void menuRows() {
   barY = cursorY();                            // a full redraw ends any slide
-  barFrom = barTo = barY;
+  barTo = barY;
   menuPaint(0, ROWS - 1);
   menuScrollbar();
 }
@@ -1760,17 +1764,18 @@ void barRedraw(int from) {
   if (i1 >= 0) menuPaint(i0, i1);
 }
 
-// One frame of the cursor bar's slide; called from loop().
+// One frame of the cursor bar's slide; called from loop(). Half the
+// remaining way, between BAR_MIN_PX and BAR_MAX_PX: eases out, and on a
+// fast spin it keeps up at ~420 px/s (20 rows a second).
 void menuBarStep() {
   if (barY == barTo) return;
   unsigned long t = millis();
   if (t - barStepAt < BAR_STEP_MS) return;
   barStepAt = t;
-  int k = imin(BAR_STEPS, (int)((t - barAt) / BAR_STEP_MS) + 1);
-  float f = (float)k / BAR_STEPS;
-  f = 1 - (1 - f) * (1 - f);                   // ease out
+  int d = barTo - barY, a = abs(d);
+  int step = imin(a, imax(BAR_MIN_PX, imin(BAR_MAX_PX, a / 2)));
   int from = barY;
-  barY = k >= BAR_STEPS ? barTo : barFrom + (int)lroundf((barTo - barFrom) * f);
+  barY += d > 0 ? step : -step;
   barRedraw(from);
 }
 
@@ -1792,18 +1797,11 @@ void menuMove(int d) {
     menuRows();                                // ~25 ms with FAST_SPI
     requestVisible(dir);
     showMs(millis() - t0);
-  } else if (millis() - lastMoveAt < BAR_FAST_MS) {
-    int from = barY;                           // a fast spin: no slide, just move it
-    barY = barFrom = barTo = cursorY();
-    barRedraw(from);
   } else {
-    barFrom = barY;                            // slide from wherever the bar is now
-    barTo = cursorY();
-    barAt = millis();
+    barTo = cursorY();                         // slide from wherever the bar is now
     barStepAt = 0;
     menuBarStep();
   }
-  lastMoveAt = millis();
   char b[16];
   snprintf(b, sizeof(b), "%d/%d", c + 1, n);
   textR(220, 0, 100, HEAD_H, 3, 6, b, 2, MUTED, BLACK);
