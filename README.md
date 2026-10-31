@@ -12,7 +12,8 @@ whatever MPD is playing — CDs, FLAC/WAV files, CUE images or internet radio.
 
 **2.4" TFT + rotary encoder** (optional)
 - Now playing: artist, title, album, year, track, time, format (`FLAC 16/44`, `MP3 320`)
-- Three more views: a tape-deck spectrum, two VU meters, a 6E1P-style magic eye
+- Three more views: a 32-band tape-deck spectrum with peak hold, two VU meters, a
+  6E1P-style magic eye
 - Knob: volume; press: play/pause; hold: next track (repeats every second)
 - Menu: queue, artists, albums, internet radio, audio CD, the USB stick with CD rips
   (CD and USB are greyed out while the drive or the stick is not plugged in)

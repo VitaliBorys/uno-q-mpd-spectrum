@@ -420,8 +420,9 @@ unsigned long volLocalAt = 0;    // last volume change made with the knob
 int clockBase = -1;              // minutes since midnight from Python, -1 = unknown
 unsigned long clockAt = 0;
 unsigned long levelsAt = 0;
-// lv message: 16 TFT bands, VU left, VU right, 13 matrix bands (each 0..255)
-const int LV_BYTES = 31;
+// lv message: 32 TFT bands, VU left, VU right, 13 matrix bands (each 0..255)
+const int TFT_BANDS = 32;
+const int LV_BYTES = TFT_BANDS + 2 + 13;
 
 // Inbox: written by the Bridge thread, read by loop()
 struct InTrack { char src[8], fmt[16], artist[48], title[72], album[56]; int year, no, of, dur, radio; };
@@ -461,15 +462,17 @@ unsigned long lastFrame = 0;
 bool onBlack = false;            // drawing on a cleared area: text boxes only as wide as the text
 
 // Animation state
-float lv[16], lvL, lvR;
+float lv[TFT_BANDS], lvL, lvR;
 const int MAT_COLS = 13, MAT_ROWS = 8;
 float matLv[MAT_COLS];               // targets from Python, 0..1
 float matH[MAT_COLS], matPk[MAT_COLS];   // bar and peak heights in rows
 unsigned long matPkAt[MAT_COLS], matAt = 0;
 uint8_t matShown[MAT_COLS * MAT_ROWS];
-float barH[16], pkH[16];
-uint8_t pkAge[16];
-uint32_t segMask[16];
+float barH[TFT_BANDS], pkH[TFT_BANDS], pkA[TFT_BANDS];   // bar, peak (segments), peak brightness 0..1
+unsigned long pkAt[TFT_BANDS];                          // when each peak was last pushed up
+uint32_t segMask[TFT_BANDS];                            // bar segments lit on screen
+int8_t pkSeg[TFT_BANDS];                                // peak segment on screen, -1 none
+uint16_t pkCol[TFT_BANDS];                              // ...and its colour
 float vuV[2], vuShown[2];
 float eyeV;
 int shK;
@@ -544,6 +547,14 @@ void k0ISR() {
 int imin(int a, int b) { return a < b ? a : b; }
 int imax(int a, int b) { return a > b ? a : b; }
 float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+// Colour between a (t = 0) and b (t = 1), in RGB565.
+uint16_t mix565(uint16_t a, uint16_t b, float t) {
+  if (t <= 0) return a;
+  if (t >= 1) return b;
+  int ra = a >> 11, ga = (a >> 5) & 63, ba = a & 31, rb = b >> 11, gb = (b >> 5) & 63, bb = b & 31;
+  int rr = ra + (int)lroundf((rb - ra) * t), gg = ga + (int)lroundf((gb - ga) * t), b2 = ba + (int)lroundf((bb - ba) * t);
+  return (uint16_t)((rr << 11) | (gg << 5) | b2);
+}
 float frand() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return (rng & 0xFFFF) / 65535.0f; }
 
 // ---- UTF-8 text (Latin + Cyrillic) ----
@@ -803,31 +814,36 @@ void nowStatic() {
 }
 
 // ---- View 2: Spectrum ----------------------------------------------------
-const int SP_BARS = 16, SP_SEGS = 16, SP_X0 = 8, SP_BW = 19, SP_TOP = 28, SP_SH = 9;
+// 32 bars of 16 segments, 31 Hz .. 16 kHz. A peak segment holds for a moment
+// above its bar, then fades out where it is (a peak-hold display).
+const int SP_BARS = TFT_BANDS, SP_SEGS = 16, SP_X0 = 16, SP_BW = 9, SP_GAP = 2, SP_TOP = 28, SP_SH = 9;
+const unsigned long SP_PEAK_HOLD_MS = 600, SP_PEAK_FADE_MS = 450;
 
-void specSeg(int b, int s, bool lit) {
-  uint16_t c;
-  if (s < 11)      c = lit ? GRN : DGRN;
-  else if (s < 14) c = lit ? YEL : DYEL;
-  else             c = lit ? RED : DRED;
-  tft.fillRect(SP_X0 + b * SP_BW, SP_TOP + (SP_SEGS - 1 - s) * SP_SH, SP_BW - 3, SP_SH - 2, c);
+uint16_t segLit(int s) { return s < 11 ? GRN : s < 14 ? YEL : RED; }
+uint16_t segDim(int s) { return s < 11 ? DGRN : s < 14 ? DYEL : DRED; }
+
+void specSegC(int b, int s, uint16_t c) {
+  tft.fillRect(SP_X0 + b * SP_BW, SP_TOP + (SP_SEGS - 1 - s) * SP_SH, SP_BW - SP_GAP, SP_SH - 2, c);
 }
+void specSeg(int b, int s, bool lit) { specSegC(b, s, lit ? segLit(s) : segDim(s)); }
 
 void specStatic() {
   for (int b = 0; b < SP_BARS; b++) {
     for (int s = 0; s < SP_SEGS; s++) specSeg(b, s, false);
-    barH[b] = pkH[b] = 0;
-    pkAge[b] = 0;
+    barH[b] = pkH[b] = pkA[b] = 0;
+    pkAt[b] = 0;
     segMask[b] = 0;
+    pkSeg[b] = -1;
   }
   struct { int bar; const char *t; } labels[] = {
-    {0, "31"}, {2, "70"}, {4, "160"}, {6, "380"}, {8, "870"},
-    {10, "2k"}, {12, "4.5k"}, {15, "16k"},
+    {0, "31"}, {3, "63"}, {7, "125"}, {10, "250"}, {14, "500"},
+    {17, "1k"}, {21, "2k"}, {24, "4k"}, {28, "8k"}, {31, "16k"},
   };
   for (auto &l : labels) {
     int w = strlen(l.t) * 6;
-    int cx = SP_X0 + l.bar * SP_BW + (SP_BW - 3) / 2;
-    text(cx - w / 2, SP_TOP + SP_SEGS * SP_SH + 4, w, l.t, 1, MUTED, BLACK);
+    int cx = SP_X0 + l.bar * SP_BW + (SP_BW - SP_GAP) / 2;
+    int x = imax(0, imin(320 - w, cx - w / 2));
+    text(x, SP_TOP + SP_SEGS * SP_SH + 4, w, l.t, 1, MUTED, BLACK);
   }
 }
 
@@ -838,19 +854,31 @@ const float FRAME_K = FRAME_MS / 33.0f;
 float easeK(float a) { return 1 - powf(1 - a, FRAME_K); }
 
 void specFrame() {
-  static const float fall = 0.7f * FRAME_K, pkFall = 0.3f * FRAME_K;
-  static const int pkHold = (int)(18 / FRAME_K);                 // ~0.6 s
+  static const float fall = 0.7f * FRAME_K;
+  unsigned long t = millis();
   for (int b = 0; b < SP_BARS; b++) {
     float target = lv[b] * SP_SEGS;
     barH[b] = fmaxf(target, barH[b] - fall);
-    if (barH[b] >= pkH[b]) { pkH[b] = barH[b]; pkAge[b] = 0; }
-    else if (++pkAge[b] > pkHold) pkH[b] = fmaxf(pkH[b] - pkFall, 0);
+    if (barH[b] >= pkH[b]) { pkH[b] = barH[b]; pkAt[b] = t; pkA[b] = 1; }
+    else if (t - pkAt[b] > SP_PEAK_HOLD_MS) {
+      pkA[b] = 1 - (float)(t - pkAt[b] - SP_PEAK_HOLD_MS) / SP_PEAK_FADE_MS;
+      if (pkA[b] <= 0) { pkA[b] = 0; pkH[b] = barH[b]; }  // gone: the next peak starts from the bar
+    }
     int h = (int)lroundf(barH[b]), p = (int)lroundf(pkH[b]);
+    // The bar's segments: only the ones that change.
     uint32_t m = h > 0 ? (1UL << h) - 1 : 0;
-    if (p > h && p > 0) m |= 1UL << (p - 1);
-    uint32_t diff = m ^ segMask[b];
+    int ps = (p > h && p > 0 && pkA[b] > 0) ? p - 1 : -1;     // peak segment, above the bar
+    uint32_t shown = segMask[b];
+    if (pkSeg[b] >= 0) shown &= ~(1UL << pkSeg[b]);         // the old peak is redrawn below
+    uint32_t diff = (m ^ shown) & ~(ps >= 0 ? 1UL << ps : 0);
     for (int s = 0; s < SP_SEGS; s++)
       if (diff & (1UL << s)) specSeg(b, s, m & (1UL << s));
+    // The peak: a lit segment fading to the dark one.
+    uint16_t pc = ps >= 0 ? mix565(segDim(ps), segLit(ps), pkA[b]) : 0;
+    if (pkSeg[b] >= 0 && pkSeg[b] != ps && !(m & (1UL << pkSeg[b])))
+      specSeg(b, pkSeg[b], false);                           // where the peak was
+    if (ps >= 0 && (ps != pkSeg[b] || pc != pkCol[b])) specSegC(b, ps, pc);
+    pkSeg[b] = ps; pkCol[b] = pc;
     segMask[b] = m;
   }
 }
@@ -1049,7 +1077,7 @@ void matrixStep() {
 // arrived for a while (paused, stopped, Python busy), everything falls to 0.
 void takeLevels() {
   if (millis() - levelsAt > 300) {
-    for (int b = 0; b < 16; b++) lv[b] = 0;
+    for (int b = 0; b < TFT_BANDS; b++) lv[b] = 0;
     lvL = lvR = 0;
   }
 }
@@ -1144,7 +1172,7 @@ void eraseView(int v) {
       break;
     case V_SPECTRUM:
       for (int i = 0; i < SP_BARS; i++)
-        tft.fillRect(SP_X0 + i * SP_BW, SP_TOP, SP_BW - 3, SP_SEGS * SP_SH, BLACK);
+        tft.fillRect(SP_X0 + i * SP_BW, SP_TOP, SP_BW - SP_GAP, SP_SEGS * SP_SH, BLACK);
       tft.fillRect(0, SP_TOP + SP_SEGS * SP_SH + 4, 320, 8, BLACK);
       break;
     case V_VU: {
@@ -1459,10 +1487,10 @@ void applyInbox() {
   if (inStNew) applyStatus();
   if (inLvNew) {
     noInterrupts();
-    for (int b = 0; b < 16; b++) lv[b] = inLv[b] / 255.0f;
-    lvL = inLv[16] / 255.0f;
-    lvR = inLv[17] / 255.0f;
-    for (int b = 0; b < MAT_COLS; b++) matLv[b] = inLv[18 + b] / 255.0f;
+    for (int b = 0; b < TFT_BANDS; b++) lv[b] = inLv[b] / 255.0f;
+    lvL = inLv[TFT_BANDS] / 255.0f;
+    lvR = inLv[TFT_BANDS + 1] / 255.0f;
+    for (int b = 0; b < MAT_COLS; b++) matLv[b] = inLv[TFT_BANDS + 2 + b] / 255.0f;
     inLvNew = false;
     interrupts();
     levelsAt = millis();
@@ -1565,13 +1593,6 @@ int fadeOld = -1, fadeNew = -1, fadeK = 0;     // list indexes, frame
 float fadeOldFrom = 1;                         // the old row's level when it began fading
 unsigned long fadeAt = 0;
 
-uint16_t mix565(uint16_t a, uint16_t b, float t) {
-  if (t <= 0) return a;
-  if (t >= 1) return b;
-  int ra = a >> 11, ga = (a >> 5) & 63, ba = a & 31, rb = b >> 11, gb = (b >> 5) & 63, bb = b & 31;
-  int rr = ra + (int)lroundf((rb - ra) * t), gg = ga + (int)lroundf((gb - ga) * t), b2 = ba + (int)lroundf((bb - ba) * t);
-  return (uint16_t)((rr << 11) | (gg << 5) | b2);
-}
 
 float barLevel(int idx) {
   Level &l = st[depth];

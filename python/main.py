@@ -22,6 +22,7 @@ from mpdui import Controller
 FIFO = "/app/viz/mpd.fifo"   # MPD FIFO; the app folder is mounted at /app
 RATE = 44100                 # FIFO format must match mpd.conf: 44100:16:2
 N = 2048                     # FFT window size (~46 ms of audio)
+N_LO = 4096                  # a longer FFT (~93 ms) for the TFT's bass bands
 
 # --- Analyzer --------------------------------------------------------------
 COLS = 13                    # LED matrix bands (the matrix is 8 x 13)
@@ -32,16 +33,19 @@ FLOOR_DB = -48.0             # level shown as an empty bar (closer to 0 = less s
 PROFILE = False              # print per-stage timings to the Python Shell every 5 s
 
 # --- TFT -------------------------------------------------------------------
-TFT_BANDS = 16               # spectrum bars on the TFT, 31 Hz .. 16 kHz
+TFT_BANDS = 32               # spectrum bars on the TFT, 31 Hz .. 16 kHz
+TFT_LO_HZ = 250              # bars below this come from the N_LO FFT
 VU_REF_DBFS = -18.0          # level that reads 0 VU (a common digital reference)
 
 # --- Setup -----------------------------------------------------------------
 # Non-blocking read so the loop keeps running while MPD is paused or stopped.
 fd = os.open(FIFO, os.O_RDONLY | os.O_NONBLOCK)
 pending = b""
-buf = np.zeros(N, dtype=np.float32)
+buf = np.zeros(N_LO, dtype=np.float32)       # the newest N_LO mono samples
 window = np.hanning(N).astype(np.float32)
 norm = window.sum() / 2      # scale so a full-scale sine reads 0 dB
+window_lo = np.hanning(N_LO).astype(np.float32)
+norm_lo = window_lo.sum() / 2
 
 # 13 log-spaced bands from 40 Hz to 16 kHz.
 edges = np.geomspace(40, 16000, COLS + 1)
@@ -59,16 +63,19 @@ for lo, hi in zip(edges[:-1], edges[1:]):
 maxlen = max(len(b) for b in bands)
 band_idx = np.array([np.pad(b, (0, maxlen - len(b)), mode="edge") for b in bands])
 
-# Same thing for the TFT's 16 bands.
+# The TFT's 32 bands. At 31 Hz a band is ~7 Hz wide, narrower than one bin
+# of the 2048-point FFT (21.5 Hz): several bars would show the same bin. So
+# the bass bars use a 4096-point FFT (10.8 Hz bins), and a band still
+# narrower than a bin reads the spectrum at its centre, interpolated
+# between the two nearest bins, so neighbouring bars differ smoothly.
+freqs_lo = np.fft.rfftfreq(N_LO, 1 / RATE)
 tft_edges = np.geomspace(31, 16000, TFT_BANDS + 1)
-tft_bands = []
+tft_plan = []                # per band: (use the N_LO FFT, bin indexes or None, centre Hz)
 for lo, hi in zip(tft_edges[:-1], tft_edges[1:]):
-    idx = np.where((freqs >= lo) & (freqs < hi))[0]
-    if len(idx) == 0:
-        idx = np.array([np.argmin(np.abs(freqs - (lo + hi) / 2))])
-    tft_bands.append(idx)
-tft_maxlen = max(len(b) for b in tft_bands)
-tft_band_idx = np.array([np.pad(b, (0, tft_maxlen - len(b)), mode="edge") for b in tft_bands])
+    use_lo = np.sqrt(lo * hi) < TFT_LO_HZ
+    f = freqs_lo if use_lo else freqs
+    idx = np.where((f >= lo) & (f < hi))[0]
+    tft_plan.append((use_lo, idx if len(idx) >= 2 else None, np.sqrt(lo * hi)))
 
 last_data = 0.0              # time of the last audio received
 rms_lr = np.zeros(2)         # left/right RMS of the latest audio, 0..1
@@ -115,7 +122,7 @@ def read_audio():
             break
         pending += chunk
 
-    pending = pending[-N * 4 * 2:]           # only the freshest audio matters
+    pending = pending[-N_LO * 4 * 2:]        # only the freshest audio matters
     usable = len(pending) - len(pending) % 4  # whole stereo 16-bit frames only
     if usable == 0:
         return
@@ -126,8 +133,8 @@ def read_audio():
     recent = data[-N * 2:] / 32768.0            # last ~46 ms, interleaved L R
     rms_lr = np.sqrt(np.mean(recent.reshape(-1, 2) ** 2, axis=0))
 
-    if len(mono) >= N:
-        buf = mono[-N:]
+    if len(mono) >= N_LO:
+        buf = mono[-N_LO:]
     else:
         buf = np.concatenate((buf[len(mono):], mono))
     last_data = time.monotonic()
@@ -135,9 +142,14 @@ def read_audio():
 
 def spectrum():
     """Matrix and TFT band levels, 0..1 (FLOOR_DB..0 dB)."""
-    spec = np.abs(np.fft.rfft(buf * window)) / norm
+    spec = np.abs(np.fft.rfft(buf[-N:] * window)) / norm
+    spec_lo = np.abs(np.fft.rfft(buf * window_lo)) / norm_lo
     db = 20 * np.log10(spec[band_idx].max(axis=1) + 1e-9)
-    db_tft = 20 * np.log10(spec[tft_band_idx].max(axis=1) + 1e-9)
+    tft = np.empty(TFT_BANDS)
+    for b, (use_lo, idx, centre) in enumerate(tft_plan):
+        sp, f = (spec_lo, freqs_lo) if use_lo else (spec, freqs)
+        tft[b] = sp[idx].max() if idx is not None else np.interp(centre, f, sp)
+    db_tft = 20 * np.log10(tft + 1e-9)
     return (np.clip((db - FLOOR_DB) / -FLOOR_DB, 0, 1),
             np.clip((db_tft - FLOOR_DB) / -FLOOR_DB, 0, 1))
 
