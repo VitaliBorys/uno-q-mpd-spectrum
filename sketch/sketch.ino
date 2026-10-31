@@ -1547,7 +1547,17 @@ int cursorY() { Level &l = st[depth]; return rowY(l.cursor - l.top); }
 // strips across all those rows at once, for the same reason as the
 // marquee: the panel refreshes column by column, and rows sent one after
 // another (each top to bottom) made the bar look cut along a diagonal.
-void menuPaint(int i0, int i1) {
+// The bar is dim on a root item whose device is missing.
+uint16_t barColorShown = 0;
+uint16_t barColor() {
+  Level &l = st[depth];
+  return l.id == L_ROOT && !rootAvailable(l.cursor) ? MUTED : VFD;
+}
+
+// Paints pixel bands [ys[2k], ys[2k+1]) of row slots i0..i1, columns xa..xb
+// (xb < 0: as wide as needed). menuPaint() is the whole rows; a sliding bar
+// only repaints the few pixel rows its edges crossed.
+void menuPaintArea(int i0, int i1, const int *ys, int nb, int xa, int xb) {
   Level &l = st[depth];
   int n = listCount(l);
   if (n <= 0) n = 1;                           // loading ("...") or empty ("(empty)"): one row
@@ -1555,8 +1565,8 @@ void menuPaint(int i0, int i1) {
   Slot sl[ROWS];
   const uint8_t *ar[1];
   decodeGlyphs(">", ar, 1);
-  bool curOff = l.id == L_ROOT && !rootAvailable(l.cursor);
-  uint16_t bar = curOff ? MUTED : VFD;
+  uint16_t bar = barColor();
+  barColorShown = bar;
   int x1 = 0;                                  // paint only as wide as needed
   for (int i = i0; i <= i1; i++) {
     Slot &q = sl[i];
@@ -1575,14 +1585,16 @@ void menuPaint(int i0, int i1) {
     x1 = imax(x1, barHere || q.used ? ROW_W : 0);
     x1 = imax(x1, rowW[i]);                     // what was drawn there before goes
   }
-  if (x1 == 0) return;
-  int y0 = rowY(i0), h = rowY(i1) + ROW_H - y0;
+  if (xb >= 0) x1 = xb;
+  if (x1 <= xa) return;
   const int SW = 8;                            // strip width, px
-  int strips = (x1 + SW - 1) / SW;
+  int strips = (x1 - xa + SW - 1) / SW;
   tft.startWrite();
-  for (int k = 0; k < strips; k++) {
-    int sx = (STRIPS_RTL ? strips - 1 - k : k) * SW;
+  for (int k = 0; k < strips; k++) for (int bnd = 0; bnd < nb; bnd++) {
+    int sx = xa + (STRIPS_RTL ? strips - 1 - k : k) * SW;
     int w = imin(SW, x1 - sx);
+    int y0 = ys[2 * bnd], h = ys[2 * bnd + 1] - y0;
+    if (h <= 0) continue;
     uint16_t *p = pbuf;
     for (int yy = y0; yy < y0 + h; yy++) {
       int i = (yy - ROW_Y0) / ROW_H, r = (yy - ROW_Y0) % ROW_H;
@@ -1606,7 +1618,14 @@ void menuPaint(int i0, int i1) {
     tft.sendPixels(pbuf, (size_t)w * h);
   }
   tft.endWrite();
-  for (int i = i0; i <= i1; i++) rowW[i] = sl[i].used ? ROW_W : 0;
+}
+
+void menuPaint(int i0, int i1) {
+  int ys[2] = {rowY(i0), rowY(i1) + ROW_H};
+  menuPaintArea(i0, i1, ys, 1, 0, -1);
+  Level &l = st[depth];
+  int n = imax(1, listCount(l));
+  for (int i = i0; i <= i1; i++) rowW[i] = l.top + i < n ? ROW_W : 0;
 }
 
 void menuRow(int i) { menuPaint(i, i); }
@@ -1754,6 +1773,10 @@ void menuBack() {
 }
 
 // Redraws the rows the bar covered at `from` and covers now (at most 3).
+// The bar moved from `from` to barY. A step shorter than the bar changes
+// only the pixel rows its top and bottom edges crossed (and the ">" that
+// goes or comes): a few rows instead of two whole ones, ~1 ms instead of
+// ~8, so the panel rarely catches a write halfway.
 void barRedraw(int from) {
   int lo = imin(from, barY), hi = imax(from, barY) + ROW_H;
   int i0 = ROWS, i1 = -1;
@@ -1761,7 +1784,14 @@ void barRedraw(int from) {
     int y = rowY(i);
     if (y + ROW_H > lo && y < hi) { i0 = imin(i0, i); i1 = imax(i1, i); }
   }
-  if (i1 >= 0) menuPaint(i0, i1);
+  if (i1 < 0) return;
+  int d = abs(barY - from);
+  if (d >= ROW_H - 1 || from < 0 || barColor() != barColorShown) { menuPaint(i0, i1); return; }
+  int a = imin(from, barY), b = imax(from, barY);
+  int ys[4] = {a, b, a + ROW_H - 1, b + ROW_H - 1};   // top edge, bottom edge
+  menuPaintArea(i0, i1, ys, 2, 0, ROW_W);
+  int arrowYs[2] = {rowY(i0), rowY(i1) + ROW_H};
+  menuPaintArea(i0, i1, arrowYs, 1, ROW_W - 18, ROW_W - 8);   // the ">" column
 }
 
 // One frame of the cursor bar's slide; called from loop(). Half the
