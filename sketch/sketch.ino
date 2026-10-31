@@ -1535,52 +1535,72 @@ void menuHeader() {
 int rowY(int i) { return ROW_Y0 + i * ROW_H; }
 int cursorY() { Level &l = st[depth]; return rowY(l.cursor - l.top); }
 
-// Row slot i (0..ROWS-1) of the screen, with the cursor bar wherever barY
-// says (it may cover part of this row while it slides). Drawn in one burst.
-void menuRow(int i) {
+// Paints row slots i0..i1 (0..ROWS-1) with the cursor bar wherever barY
+// says (while it slides it covers parts of two rows). Sent in vertical
+// strips across all those rows at once, for the same reason as the
+// marquee: the panel refreshes column by column, and rows sent one after
+// another (each top to bottom) made the bar look cut along a diagonal.
+void menuPaint(int i0, int i1) {
   Level &l = st[depth];
-  int idx = l.top + i;
-  int y = rowY(i);
   int n = listCount(l);
   if (n <= 0) n = 1;                           // loading ("...") or empty ("(empty)"): one row
-  if (idx >= n) {
-    if (rowW[i] > 0) tft.fillRect(0, y, rowW[i], ROW_H, BLACK);
-    rowW[i] = 0;
-    return;
-  }
-  char b[64];
-  listLabel(l, idx, b, sizeof(b));
-  bool off = l.id == L_ROOT && !rootAvailable(idx);
-  bool curOff = l.id == L_ROOT && !rootAvailable(l.cursor);
-  uint16_t fg = off ? LINE : VFD, bar = curOff ? MUTED : VFD;
-  bool arrow = opensSubmenu(l) && !off && idx == l.cursor && barY == y;
-  const uint8_t *gl[72], *ar[1];
-  int len = imin(decodeGlyphs(b, gl, 72), (ROW_W - 12 - 18) / 12);
+  struct Slot { const uint8_t *gl[25]; int len; uint16_t fg; bool arrow, used; };
+  Slot sl[ROWS];
+  const uint8_t *ar[1];
   decodeGlyphs(">", ar, 1);
-  int bTop = barY - y, bBot = bTop + ROW_H - 1;  // the bar, in this row's pixel rows
-  uint16_t *p = pbuf;
-  for (int r = 0; r < ROW_H; r++) {
-    bool inBar = barY >= 0 && r >= bTop && r < bBot;
-    int gy = r - 2;
-    bool inY = gy >= 0 && gy < 16;
-    gy /= 2;
-    for (int c = 0; c < ROW_W; c++) {
-      bool on = false;
-      if (inY) {
-        int gx = c - 12;
-        if (gx >= 0 && gx / 12 < len && (gx / 2) % 6 < 5) on = (gl[gx / 12][(gx / 2) % 6] >> gy) & 1;
-        if (arrow && c >= ROW_W - 18 && c < ROW_W - 8) on = (ar[0][(c - (ROW_W - 18)) / 2] >> gy) & 1;
-      }
-      bool b2 = inBar && c >= 6;
-      *p++ = b2 ? (on ? BLACK : bar) : (on ? fg : BLACK);
+  bool curOff = l.id == L_ROOT && !rootAvailable(l.cursor);
+  uint16_t bar = curOff ? MUTED : VFD;
+  int x1 = 0;                                  // paint only as wide as needed
+  for (int i = i0; i <= i1; i++) {
+    Slot &q = sl[i];
+    int idx = l.top + i;
+    q.used = idx < n;
+    q.len = 0; q.arrow = false; q.fg = VFD;
+    if (q.used) {
+      char b[64];
+      listLabel(l, idx, b, sizeof(b));
+      bool off = l.id == L_ROOT && !rootAvailable(idx);
+      q.fg = off ? LINE : VFD;
+      q.len = imin(decodeGlyphs(b, q.gl, 25), (ROW_W - 12 - 18) / 12);
+      q.arrow = opensSubmenu(l) && !off && idx == l.cursor && barY == rowY(i);
     }
+    bool barHere = barY >= 0 && barY < rowY(i) + ROW_H && barY + ROW_H - 1 > rowY(i);
+    x1 = imax(x1, barHere || q.used ? ROW_W : 0);
+    x1 = imax(x1, rowW[i]);                     // what was drawn there before goes
   }
+  if (x1 == 0) return;
+  int y0 = rowY(i0), h = rowY(i1) + ROW_H - y0;
+  const int SW = 8;                            // strip width, px
   tft.startWrite();
-  tft.window(0, y, ROW_W - 1, y + ROW_H - 1);
-  tft.sendPixels(pbuf, (size_t)ROW_W * ROW_H);
+  for (int sx = 0; sx < x1; sx += SW) {
+    int w = imin(SW, x1 - sx);
+    uint16_t *p = pbuf;
+    for (int yy = y0; yy < y0 + h; yy++) {
+      int i = (yy - ROW_Y0) / ROW_H, r = (yy - ROW_Y0) % ROW_H;
+      Slot &q = sl[i];
+      bool inBar = barY >= 0 && yy >= barY && yy < barY + ROW_H - 1;
+      int gy = r - 2;
+      bool inY = q.used && gy >= 0 && gy < 16;
+      gy /= 2;
+      for (int c = sx; c < sx + w; c++) {
+        bool on = false;
+        if (inY) {
+          int gx = c - 12;
+          if (gx >= 0 && gx / 12 < q.len && (gx / 2) % 6 < 5) on = (q.gl[gx / 12][(gx / 2) % 6] >> gy) & 1;
+          if (q.arrow && c >= ROW_W - 18 && c < ROW_W - 8) on = (ar[0][(c - (ROW_W - 18)) / 2] >> gy) & 1;
+        }
+        bool b2 = inBar && c >= 6;
+        *p++ = b2 ? (on ? BLACK : bar) : (on ? q.fg : BLACK);
+      }
+    }
+    tft.window(sx, y0, sx + w - 1, y0 + h - 1);
+    tft.sendPixels(pbuf, (size_t)w * h);
+  }
   tft.endWrite();
-  rowW[i] = ROW_W;
+  for (int i = i0; i <= i1; i++) rowW[i] = sl[i].used ? ROW_W : 0;
 }
+
+void menuRow(int i) { menuPaint(i, i); }
 
 void menuScrollbar() {
   Level &l = st[depth];
@@ -1596,7 +1616,7 @@ void menuScrollbar() {
 void menuRows() {
   barY = cursorY();                            // a full redraw ends any slide
   barFrom = barTo = barY;
-  for (int i = 0; i < ROWS; i++) menuRow(i);
+  menuPaint(0, ROWS - 1);
   menuScrollbar();
 }
 
@@ -1727,10 +1747,12 @@ void menuBack() {
 // Redraws the rows the bar covered at `from` and covers now (at most 3).
 void barRedraw(int from) {
   int lo = imin(from, barY), hi = imax(from, barY) + ROW_H;
+  int i0 = ROWS, i1 = -1;
   for (int i = 0; i < ROWS; i++) {
     int y = rowY(i);
-    if (y + ROW_H > lo && y < hi) menuRow(i);
+    if (y + ROW_H > lo && y < hi) { i0 = imin(i0, i); i1 = imax(i1, i); }
   }
+  if (i1 >= 0) menuPaint(i0, i1);
 }
 
 // One frame of the cursor bar's slide; called from loop().
