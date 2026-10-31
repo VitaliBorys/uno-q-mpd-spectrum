@@ -76,6 +76,7 @@ const bool SHOW_MS = true;             // redraw time in the corner
 const bool SPI16 = true;               // 16-bit SPI words for pixels (when FAST_SPI is off)
 const bool FAST_SPI = true;            // write SPI2's registers directly, skipping Zephyr's driver
 const int FAST_SPI_DIV = 4;            // SPI clock = 160 MHz / this: 4 = 40 MHz, 8 = 20 MHz
+const bool MENU_STRIPS_RTL = false;    // menu strips right to left (to match the panel's refresh)
 const unsigned long IDLE_MS = 60000;   // no playback this long -> digital rain
 const int VOLUME_STEP = 2;             // percent per click (must match Python)
 // LED matrix spectrum (13 bands from Python; the bars are animated here)
@@ -1520,6 +1521,8 @@ bool rootAvailable(int i) {
 // before the cursor gets there. The cursor bar slides between rows.
 const int BAR_STEPS = 4;                       // frames for one slide
 const unsigned long BAR_STEP_MS = 16;
+const unsigned long BAR_FAST_MS = 150;         // clicks closer than this: no slide
+unsigned long lastMoveAt = 0;
 
 void menuHeader() {
   Level &l = st[depth];
@@ -1571,8 +1574,10 @@ void menuPaint(int i0, int i1) {
   if (x1 == 0) return;
   int y0 = rowY(i0), h = rowY(i1) + ROW_H - y0;
   const int SW = 8;                            // strip width, px
+  int strips = (x1 + SW - 1) / SW;
   tft.startWrite();
-  for (int sx = 0; sx < x1; sx += SW) {
+  for (int k = 0; k < strips; k++) {
+    int sx = (MENU_STRIPS_RTL ? strips - 1 - k : k) * SW;
     int w = imin(SW, x1 - sx);
     uint16_t *p = pbuf;
     for (int yy = y0; yy < y0 + h; yy++) {
@@ -1787,6 +1792,10 @@ void menuMove(int d) {
     menuRows();                                // ~25 ms with FAST_SPI
     requestVisible(dir);
     showMs(millis() - t0);
+  } else if (millis() - lastMoveAt < BAR_FAST_MS) {
+    int from = barY;                           // a fast spin: no slide, just move it
+    barY = barFrom = barTo = cursorY();
+    barRedraw(from);
   } else {
     barFrom = barY;                            // slide from wherever the bar is now
     barTo = cursorY();
@@ -1794,6 +1803,7 @@ void menuMove(int d) {
     barStepAt = 0;
     menuBarStep();
   }
+  lastMoveAt = millis();
   char b[16];
   snprintf(b, sizeof(b), "%d/%d", c + 1, n);
   textR(220, 0, 100, HEAD_H, 3, 6, b, 2, MUTED, BLACK);
