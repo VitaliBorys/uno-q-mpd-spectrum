@@ -372,9 +372,13 @@ const uint16_t EYE_G = RGB(150, 255, 30);
 const uint16_t EYE_D = RGB(22, 34, 6);
 const uint16_t EYE_RIM = RGB(30, 44, 10);
 const uint16_t EYE_HUB = RGB(10, 14, 4);
-const uint16_t MX_HEAD = RGB(190, 255, 210);
-const uint16_t MX_MID = RGB(0, 150, 70);
-const uint16_t MX_DARK = RGB(0, 70, 32);
+// Rain shades: 0 empty, 1..7 the trail from dark to bright, 8 the head.
+const uint16_t MX_SHADE[9] = {
+  RGB(0, 0, 0), RGB(0, 40, 18), RGB(0, 62, 28), RGB(0, 88, 40), RGB(0, 118, 55),
+  RGB(0, 152, 72), RGB(0, 195, 92), RGB(0, 255, 120), RGB(190, 255, 210),
+};
+const uint8_t MX_HEAD = 8;
+const unsigned long RAIN_TICK_MS = 16;   // the rain's clock: ~60 ticks a second
 const uint16_t EYE_DOT = RGB(90, 140, 20);
 
 // ---- Layout --------------------------------------------------------------
@@ -445,7 +449,7 @@ bool swallowRelease = false;
 unsigned long pausedSince = 0, lastInputAt = 0, rainFrameAt = 0;
 RainCol rain[MX_COLS];
 uint8_t mxGlyph[MX_ROWS][MX_COLS];
-uint8_t mxLevel[MX_ROWS][MX_COLS];   // 0 empty, 1 dark, 2 mid, 3 bright, 4 head
+uint8_t mxLevel[MX_ROWS][MX_COLS];   // shade, see MX_SHADE
 
 // Text renderer buffer: one strip of pixels
 uint16_t pbuf[8192];
@@ -1102,9 +1106,10 @@ void eraseView(int v) {
 }
 
 // ---- Idle screen: digital rain --------------------------------------------
-// Columns of glyphs fall at different speeds: a pale head, a bright glyph
-// behind it, then the trail fades through mid and dark green. Only the few
-// cells that change are redrawn each frame.
+// Columns of glyphs fall at five different speeds, cell by cell as in the
+// film: a pale head, a bright glyph behind it, then the trail fades evenly
+// through six greens to dark. Only the cells whose shade changes are
+// redrawn on a tick.
 int irand(int n) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng % n; }
 
 const uint8_t *rainGlyph(uint8_t id) {
@@ -1115,7 +1120,7 @@ void mxDraw(int r, int c) {
   int x = MX_X0 + c * MX_CW, y = r * MX_CH;
   uint8_t lv = mxLevel[r][c];
   if (lv == 0) { tft.fillRect(x, y, MX_CW, MX_CH, BLACK); return; }
-  uint16_t fg = lv == 4 ? MX_HEAD : lv == 3 ? VFD : lv == 2 ? MX_MID : MX_DARK;
+  uint16_t fg = MX_SHADE[lv];
   const uint8_t *g = rainGlyph(mxGlyph[r][c]);
   uint16_t *p = pbuf;
   for (int py = 0; py < MX_CH; py++)
@@ -1132,8 +1137,8 @@ void mxDraw(int r, int c) {
 
 void mxSet(int r, int c, uint8_t lv) {
   if (r < 0 || r >= MX_ROWS) return;
-  if (lv == 4) mxGlyph[r][c] = irand(KANA_COUNT + 10);
-  if (mxLevel[r][c] == lv && lv != 4) return;
+  if (lv == MX_HEAD) mxGlyph[r][c] = irand(KANA_COUNT + 10);
+  if (mxLevel[r][c] == lv && lv != MX_HEAD) return;
   mxLevel[r][c] = lv;
   mxDraw(r, c);
 }
@@ -1141,27 +1146,32 @@ void mxSet(int r, int c, uint8_t lv) {
 void rainReset(int c, bool first) {
   rain[c].head = first ? -irand(MX_ROWS * 2) : -irand(10);
   rain[c].len = 6 + irand(11);
-  rain[c].period = 1 + irand(3);
-  rain[c].phase = 0;
+  rain[c].period = 3 + irand(5);       // a row every 3..7 ticks: 48..112 ms
+  rain[c].phase = irand(rain[c].period);
+}
+
+// Shade of the cell d rows behind the head of a trail len cells long: the
+// head, one bright glyph, then the trail fades evenly to dark.
+uint8_t rainShade(int d, int len) {
+  if (d == 0) return MX_HEAD;
+  if (d >= len) return 0;
+  if (d == 1) return 7;
+  return 1 + (5 * (len - 1 - d) + (len - 2) / 2) / (len - 2);   // 6 .. 1
 }
 
 void rainStep(int c) {
   RainCol &k = rain[c];
   int h = ++k.head;
-  mxSet(h, c, 4);
-  mxSet(h - 1, c, 3);
-  mxSet(h - 3, c, 2);
-  if (k.len * 2 / 3 > 3) mxSet(h - k.len * 2 / 3, c, 1);
-  mxSet(h - k.len, c, 0);
+  for (int d = 0; d <= k.len; d++) mxSet(h - d, c, rainShade(d, k.len));   // only changes are drawn
   if (h - k.len >= MX_ROWS) rainReset(c, false);
 }
 
 void rainFrame() {
   for (int c = 0; c < MX_COLS; c++)
     if (++rain[c].phase >= rain[c].period) { rain[c].phase = 0; rainStep(c); }
-  for (int i = 0; i < 3; i++) {                       // glyphs flicker in the trails
+  {                                                   // glyphs flicker in the trails
     int r = irand(MX_ROWS), c = irand(MX_COLS);
-    if (mxLevel[r][c] == 2 || mxLevel[r][c] == 3) {
+    if (mxLevel[r][c] >= 4 && mxLevel[r][c] < MX_HEAD) {
       mxGlyph[r][c] = irand(KANA_COUNT + 10);
       mxDraw(r, c);
     }
@@ -1801,7 +1811,7 @@ void loop() {
   }
 
   if (idle) {
-    if (t - rainFrameAt >= 40) { rainFrameAt = t; rainFrame(); }
+    if (t - rainFrameAt >= RAIN_TICK_MS) { rainFrameAt = t; rainFrame(); }
     return;
   }
   if (!playing && t - pausedSince >= IDLE_MS && t - lastInputAt >= IDLE_MS) { enterIdle(); return; }
