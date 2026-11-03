@@ -91,3 +91,18 @@ Things found out the hard way on this setup, so they don't get lost.
   last one. A bare `cdda://` in the queue made the drive eject the disc.
 - Spinning up takes 10–20 s after inserting a disc; switching tracks
   1–3 s.
+
+## Planned hardware
+
+- **Turntable: Audio-Technica AT-LP60XUSB** (fully automatic, built-in
+  phono preamp, USB + line out; 559–629 zł in Poland, Nov 2026). Over USB
+  it should show up as a capture sound card: play it live through MPD's
+  `alsa://` input (DAC + analyzer), record with `arecord`. Not tried yet.
+- **Bigger screen: 3.5" IPS ST7796 320×480 + GT911 capacitive touch**
+  (AliExpress, "SPI Interface" variant: M0/M1/M2 all at 1 = 4-wire SPI,
+  16-pin header J4). TE is on a test pad in the middle of the board, not on
+  the header: solder a wire to it (D7) to sync writes and stop tearing.
+  Touch on I²C (INT → A0, RST → A1). Needs a separate EC11 (e.g. KY-040)
+  and K0 button. Check VDD (3.3 or 5 V) before wiring.
+- **RTL-SDR Blog** kit (arrived Nov 2026): FM radio via `rtl_fm`, not set
+  up yet.
