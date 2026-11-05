@@ -514,6 +514,7 @@ class Controller:
         self.events = queue.Queue()
         self.last_trk = None
         self.last_minute = -1
+        self.fm_orphan = 0           # pushes in a row: MPD plays FM, the service has no listener
         for target in (self._watch, self._work, self._tick):
             threading.Thread(target=target, daemon=True).start()
 
@@ -546,6 +547,7 @@ class Controller:
             song = self.mpd.command("currentsong")
             codec = self._cue_codec(song.get("file", ""))
         fm = fm_api("/status") if song.get("file") == FM_URL else None
+        self._fm_watch(status, fm)
         trk = describe_track(song, status, self.radio, codec, fm)
         if force or trk != self.last_trk:
             src, fmt, artist, title, album, *nums = trk
@@ -557,6 +559,20 @@ class Controller:
         self.starting = st[0] == 3
         self.send("st", *st)
         return status
+
+    def _fm_watch(self, status, fm):
+        """The FM service restarted (or rtl_fm died and the connection went):
+        MPD keeps "playing" a dead stream in silence. If MPD plays FM but the
+        service has had no listener for two looks in a row (~10 s; not during
+        a scan, and the service must be up), have MPD connect again."""
+        if (fm is not None and status.get("state") == "play" and not fm.get("scan")
+                and fm.get("listeners") == 0):
+            self.fm_orphan += 1
+            if self.fm_orphan >= 2:
+                self.fm_orphan = 0
+                self.events.put(("fm_reconnect", 0))
+        else:
+            self.fm_orphan = 0
 
     def _cue_codec(self, path):
         """Tracks of a CUE sheet look like "Album/album.cue/track0003": no
@@ -673,6 +689,13 @@ class Controller:
                 elif kind == "reload":
                     with self.lock:
                         self.library.load(self.mpd)
+                elif kind == "fm_reconnect":
+                    with self.lock:
+                        status = self.mpd.command("status")
+                        if (self.mpd.command("currentsong").get("file") == FM_URL
+                                and status.get("state") == "play"):
+                            print("[mpdui] FM stream lost: reconnecting")
+                            self.mpd.batch(["stop", f"play {status.get('song', 0)}"])
                 elif kind == "get":
                     self._page(*value)
                 elif kind == "sel":
