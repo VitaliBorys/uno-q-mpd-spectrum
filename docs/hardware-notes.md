@@ -92,6 +92,18 @@ Things found out the hard way on this setup, so they don't get lost.
 - Spinning up takes 10–20 s after inserting a disc; switching tracks
   1–3 s.
 
+## RTL-SDR (FM radio)
+
+- RTL-SDR Blog V3 (R820T2 tuner), `0bda:2838`. The kernel has no DVB driver
+  for it, so nothing to blacklist. USB access: group `plugdev` (log in again
+  after `usermod`; the service gets it from `SupplementaryGroups`).
+- One program at a time can use it: `usb_claim_interface error -6` = busy.
+- `rtl_fm` takes ~60 % of a core; the whole FM chain with stereo ~100 %.
+- Indoors with the telescopic dipole: 21 peaks in the band, 11 stations
+  with RDS (Warsaw).
+- `rtl_fm -r` gave whistles (wide FM, 200k -> 48k) and pure silence (narrow
+  FM, 16k -> 48k): resample with sox instead. Details: `tools/fm-radio`.
+
 ## Planned hardware
 
 - **Turntable: Audio-Technica AT-LP60XUSB** (fully automatic, built-in
@@ -104,5 +116,3 @@ Things found out the hard way on this setup, so they don't get lost.
   the header: solder a wire to it (D7) to sync writes and stop tearing.
   Touch on I²C (INT → A0, RST → A1). Needs a separate EC11 (e.g. KY-040)
   and K0 button. Check VDD (3.3 or 5 V) before wiring.
-- **RTL-SDR Blog** kit (arrived Nov 2026): FM radio via `rtl_fm`, not set
-  up yet.
