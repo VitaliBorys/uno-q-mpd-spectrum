@@ -47,6 +47,7 @@ RETRY_S = 5                  # a listener without audio this long: start the tun
 CONFIG = os.path.expanduser("~/.config/fm-radio")
 STATE = os.path.join(CONFIG, "state.json")
 STATIONS = os.path.join(CONFIG, "stations.txt")
+SCAN_NAMES = os.path.join(CONFIG, "scan-names.json")   # what the last scan named them
 CHUNK = 4096                 # bytes per read
 BUFFER_S = 2.0               # audio kept for a listener that falls behind
 
@@ -55,7 +56,9 @@ SCAN_BAND = "87.5M:108M:100k"
 SCAN_SWEEP_S = 10            # rtl_power integration
 SCAN_ABOVE_DB = 6            # a peak this much above the band's median is a station
 SCAN_MAX = 30
-SCAN_RDS_S = 6               # how long to wait for a station's name
+SCAN_RDS_S = 10              # how long to listen for a station's name...
+SCAN_NO_RDS_S = 3            # ...or less if no RDS at all shows up by then
+SCAN_PS_SURE = 3             # the same name this many times: done early
 
 AUDIO_BYTES_S = AUDIO_RATE * 2
 MIME = f"audio/L16;rate={AUDIO_RATE};channels=1"   # raw PCM, MPD's pcm decoder
@@ -80,6 +83,21 @@ def song_from_radiotext(text):
         artist, title = body.split(" - ", 1)
         return artist.strip(), title.strip()
     return ("", body.strip()) if m else None
+
+
+def station_name(names):
+    """A name from the station names (PS) heard during the scan. A name seen
+    only once may carry a bit error ("Warsza}b"); some stations alternate
+    two or three words ("Radio", "Kolor") or scroll whole song titles."""
+    counts = {}
+    for n in names:
+        counts[n] = counts.get(n, 0) + 1
+    sure = [n for n in dict.fromkeys(names) if counts[n] >= 2]   # first-seen order
+    if not sure:
+        return names[0] if names else ""
+    if len(sure) <= 3:
+        return " ".join(sure)[:24]
+    return max(sure, key=lambda n: counts[n])   # scrolling text: the most frequent part
 
 
 def load_stations():
@@ -325,11 +343,20 @@ class Radio:
                 key = pi or mhz
                 if key not in best or power > best[key][3]:
                     best[key] = (mhz, ps, pi, power)
-            old = dict(load_stations())                  # names edited by hand stay
-            stations = sorted((mhz, old.get(mhz) or ps or f"{mhz:.1f} MHz")
-                              for mhz, ps, _, _ in best.values())
+            # A name edited by hand (not what the last scan gave) stays.
+            old = dict(load_stations())
+            try:
+                with open(SCAN_NAMES) as f:
+                    auto = {float(k): v for k, v in json.load(f).items()}
+            except (OSError, ValueError):
+                auto = {}
+            named = {mhz: ps or f"{mhz:.1f} MHz" for mhz, ps, _, _ in best.values()}
+            stations = sorted((mhz, old[mhz] if mhz in old and old[mhz] != auto.get(mhz, old[mhz])
+                               else name) for mhz, name in named.items())
             if stations:
                 save_stations(stations)
+                with open(SCAN_NAMES, "w") as f:
+                    json.dump({str(m): n for m, n in named.items()}, f, ensure_ascii=False)
             log(f"scan: {len(stations)} stations saved")
         except Exception as exc:
             log(f"scan failed: {exc}")
@@ -375,11 +402,16 @@ class Radio:
         red = subprocess.Popen([self.redsea, "-r", str(MPX_RATE)], stdin=rtl.stdout,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         rtl.stdout.close()
-        ps, pi = "", ""
-        end = time.monotonic() + SCAN_RDS_S
+        names, pi = [], ""           # every station name heard, in order
+        t0 = time.monotonic()
         buf = b""
         try:
-            while time.monotonic() < end and not ps:
+            while True:
+                t = time.monotonic() - t0
+                if t > SCAN_RDS_S or (t > SCAN_NO_RDS_S and not pi):
+                    break
+                if names and names.count(names[0]) >= SCAN_PS_SURE and len(set(names)) == 1:
+                    break
                 ready, _, _ = select.select([red.stdout], [], [], 0.5)
                 if not ready:
                     continue
@@ -395,7 +427,7 @@ class Radio:
                         continue
                     pi = g.get("pi", pi)
                     if g.get("ps", "").strip():
-                        ps = g["ps"].strip()
+                        names.append(g["ps"].strip())
         finally:
             for p in (red, rtl):
                 p.terminate()
@@ -404,7 +436,7 @@ class Radio:
                     p.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     p.kill()
-        return ps, pi
+        return station_name(names), pi
 
     # --- listeners -------------------------------------------------------
     def listen(self, write):
