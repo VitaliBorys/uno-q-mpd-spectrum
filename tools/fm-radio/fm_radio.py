@@ -97,7 +97,7 @@ class Radio:
             rtl = subprocess.Popen(
                 ["rtl_fm", "-M", "fm", "-l", "0", "-A", "std", "-s", str(MPX_RATE),
                  "-g", str(GAIN), "-f", f"{self.mhz}M", "-"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             # De-emphasis 50 us = a first-order low-pass at 3183 Hz; above 15 kHz
             # there's the 19 kHz pilot, stereo and RDS, not sound. The output is
             # big-endian, as audio/L16 is.
@@ -115,6 +115,7 @@ class Radio:
                 self.procs.append(red)
             log(f"tuner on, {self.mhz} MHz")
         threading.Thread(target=self._pump, args=(gen, rtl, sox, red), daemon=True).start()
+        threading.Thread(target=self._stderr, args=(rtl,), daemon=True).start()
         threading.Thread(target=self._audio, args=(gen, sox), daemon=True).start()
         if red:
             threading.Thread(target=self._rds, args=(gen, red), daemon=True).start()
@@ -164,7 +165,17 @@ class Radio:
                 except (BrokenPipeError, ValueError, OSError):
                     pass
         if gen == self.gen:
-            log("rtl_fm ended")
+            # It died (stick unplugged or busy): clean up, so the next listener
+            # starts it again instead of waiting for audio that won't come.
+            log(f"rtl_fm ended, exit code {rtl.wait()}")
+            threading.Thread(target=self.stop, daemon=True).start()
+
+    def _stderr(self, rtl):
+        """rtl_fm's messages into our log (tuner, sample rate, errors)."""
+        for line in rtl.stderr:
+            line = line.decode(errors="replace").strip()
+            if line:
+                log("rtl_fm:", line)
 
     def _audio(self, gen, sox):
         """sox's 48 kHz audio into the buffer the HTTP listener reads."""
