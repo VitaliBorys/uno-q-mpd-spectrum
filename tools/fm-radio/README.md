@@ -42,16 +42,27 @@ sudo systemctl enable --now fm-radio
 journalctl -u fm-radio -f            # its log
 ```
 
-## Try it
+## Use
+
+From the remote: Menu → **FM** (greyed out while the stick is unplugged).
+The first time, pick **Scan for stations** (~1 min: a sweep of the band,
+then a few seconds on every peak for its RDS name). The list is saved in
+`~/.config/fm-radio/stations.txt` (`107.5 | Radio ZET` per line): rename
+or delete stations there; a new scan keeps the names you gave.
+
+On the Now playing screen: the station's RDS name, and the song on air
+from RadioText+ or the radiotext ("GRAMY: Artist - Title"; "next" and
+slogans are skipped).
+
+By hand:
 
 ```sh
 curl "localhost:8001/tune?f=107.5"   # MHz
 mpc clear; mpc add http://localhost:8001/fm; mpc play
-curl localhost:8001/status           # frequency, RDS name and text
+curl localhost:8001/status           # frequency, RDS, scan progress
+curl localhost:8001/stations
+curl localhost:8001/scan             # stops the sound for the scan
 ```
-
-Finding stations: `rtl_power -f 87.5M:108M:100k -g 30 -i 10 -1 fm.csv`
-(the service must not be playing: one program at a time can use the stick).
 
 ## Notes
 

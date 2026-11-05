@@ -369,18 +369,19 @@ struct NowInfo {
   bool radio;
 };
 
-enum { L_ROOT, L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD, L_USB, L_SETTINGS };
+enum { L_ROOT, L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD, L_USB, L_SETTINGS, L_FM };
 enum { V_NOW, V_SPECTRUM, V_VU, V_EYE };
 
 // ---- Menu ----------------------------------------------------------------
 // List ids, shared with Python: 1 queue, 2 artists, 3 an artist's albums,
-// 4 albums, 5 radio, 6 CD. The top level (0) is drawn by the sketch itself.
-const char *const ROOT_ITEMS[] = {"Queue", "Artists", "Albums", "Radio", "CD", "USB", "Settings"};
-const uint8_t ROOT_LISTS[] = {L_QUEUE, L_ARTISTS, L_ALBUMS, L_RADIO, L_CD, L_USB, L_SETTINGS};
+// 4 albums, 5 radio, 6 CD, 7 USB, 9 FM. The top level (0) and Settings (8)
+// are drawn by the sketch itself.
+const char *const ROOT_ITEMS[] = {"Queue", "Artists", "Albums", "Radio", "FM", "CD", "USB", "Settings"};
+const uint8_t ROOT_LISTS[] = {L_QUEUE, L_ARTISTS, L_ALBUMS, L_RADIO, L_FM, L_CD, L_USB, L_SETTINGS};
 const int ROOT_N = sizeof(ROOT_LISTS) / sizeof(ROOT_LISTS[0]);
 // Devices Python reports with dev(mask); a root item whose device is missing
 // is drawn dim and only shows a hint.
-const int DEV_CD = 1, DEV_USB = 2;
+const int DEV_CD = 1, DEV_USB = 2, DEV_FM = 4;
 
 // ---- Display, colours ----------------------------------------------------
 FastTFT tft(240, 320, TFT_CS, TFT_DC, TFT_RST);
@@ -452,7 +453,7 @@ volatile int inClk = -1;
 volatile int inDev = -1;
 uint8_t inCfg[S_COUNT + 1];             // cfg: the settings, then the last view
 volatile bool inCfgNew = false;
-int devMask = DEV_CD | DEV_USB;            // until Python says otherwise
+int devMask = DEV_CD | DEV_USB | DEV_FM;   // until Python says otherwise
 const int INQ = 40;              // a page is 9 messages; a prefetch can add another 9
 InItem inQ[INQ];                 // menu page/item messages, a small ring buffer
 volatile uint8_t inQHead = 0, inQTail = 0;
@@ -811,7 +812,7 @@ void nowTime(bool full) {
 
 void nowMeta(char *b, size_t n) {
   char y[8] = "", t[16] = "";
-  if (now.radio) { snprintf(b, n, "internet radio"); return; }
+  if (now.radio) { snprintf(b, n, strcmp(now.src, "FM") ? "internet radio" : "FM radio"); return; }
   if (now.year > 0) snprintf(y, sizeof(y), "%d   ", now.year);
   if (now.no > 0 && now.of > 0) snprintf(t, sizeof(t), "track %d/%d", now.no, now.of);
   else if (now.no > 0) snprintf(t, sizeof(t), "track %d", now.no);
@@ -1671,6 +1672,7 @@ const char *listTitle(const Level &l) {
     case L_ALBUMS: return "ALBUMS";
     case L_RADIO: return "RADIO";
     case L_USB: return "USB";
+    case L_FM: return "FM";
     case L_SETTINGS: return "SETTINGS";
     default: return "CD";
   }
@@ -1684,6 +1686,7 @@ bool rootAvailable(int i) {
   uint8_t id = ROOT_LISTS[i];
   if (id == L_CD) return devMask & DEV_CD;
   if (id == L_USB) return devMask & DEV_USB;
+  if (id == L_FM) return devMask & DEV_FM;
   return true;
 }
 
@@ -2120,7 +2123,10 @@ void menuSelect() {
       break;
     case L_ROOT: {
       uint8_t id = ROOT_LISTS[i];
-      if (!rootAvailable(i)) { toast(id == L_CD ? "No CD drive" : "No USB stick"); break; }
+      if (!rootAvailable(i)) {
+        toast(id == L_CD ? "No CD drive" : id == L_FM ? "No FM tuner" : "No USB stick");
+        break;
+      }
       menuOpen(id, 0, id == L_QUEUE && curSong >= 0 ? curSong : 0);
       break;
     }
@@ -2134,6 +2140,13 @@ void menuSelect() {
       menuHeader();
       break;
     }
+    case L_FM:
+      if (listCount(l) <= 0) break;
+      Bridge.notify("sel", (int)l.id, l.ctx, i, 0);
+      // The last row is "Scan": stay, Python shows the progress in the list.
+      if (i == listCount(l) - 1) toast("Scanning, ~1 min");
+      else menuExit(-1);
+      break;
     default:                                   // queue, albums, radio: play it
       if (listCount(l) <= 0) break;
       Bridge.notify("sel", (int)l.id, l.ctx, i, 0);
@@ -2144,7 +2157,7 @@ void menuSelect() {
 
 void menuLong() {
   Level &l = st[depth];
-  if (l.id == L_ROOT || l.id == L_QUEUE || l.id == L_SETTINGS || listCount(l) <= 0) return;
+  if (l.id == L_ROOT || l.id == L_QUEUE || l.id == L_SETTINGS || l.id == L_FM || listCount(l) <= 0) return;
   Bridge.notify("sel", (int)l.id, l.ctx, l.cursor, 1);
   toast("Added to queue");
 }

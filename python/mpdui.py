@@ -5,7 +5,7 @@ MPD side of the physical controller (TFT + knob + buttons on the MCU).
     trk(src, fmt, artist, title, album, year, no, of, dur, radio)
     st(state, elapsed, volume, repeat, random, song)
     clk(minutes since midnight)
-    dev(mask)     CD drive (1) and USB stick (2) present
+    dev(mask)     CD drive (1), USB stick (2), FM tuner (4) present
     cfg(bytes)    the settings (index of each value) and the last view
   and stores what the Settings menu changes: set(key, index)
 - Turns knob and button events from the MCU into MPD commands:
@@ -30,6 +30,7 @@ import socket
 import struct
 import threading
 import time
+import urllib.request
 from datetime import datetime
 
 try:
@@ -46,7 +47,8 @@ CD_CACHE_S = 5               # how long a probe of the disc stays valid
 DEV_POLL_S = 2               # how often to look for the CD drive and the USB stick
 
 # Devices, as the dev(mask) bits (must match the sketch)
-DEV_CD, DEV_USB = 1, 2
+DEV_CD, DEV_USB, DEV_FM = 1, 2, 4
+FM_USB_IDS = {("0bda", "2838"), ("0bda", "2832")}   # RTL-SDR sticks (RTL2832U)
 USB_PART = "rips"            # GPT partition name of the stick with the rips
 USB_DIR = "rips"             # its folder in MPD's music_directory
 # A stick pulled while mounted stays mounted (dead) until the automount idle
@@ -59,6 +61,7 @@ CMD_TOGGLE, CMD_NEXT, CMD_PREV = 1, 2, 3
 
 # Menu lists (must match the sketch's enum)
 L_QUEUE, L_ARTISTS, L_ARTIST_ALBUMS, L_ALBUMS, L_RADIO, L_CD, L_USB = 1, 2, 3, 4, 5, 6, 7
+L_FM = 9                     # (8 is the sketch's own Settings list)
 PAGE = 8                     # rows on the screen
 ITEM_LIMIT = 64              # bytes per menu row
 CURRENT = "\x10"             # glyph 16 in the sketch's font: a small play triangle
@@ -86,6 +89,21 @@ def default_gateway():
 
 MPD_HOST = os.environ.get("MPD_HOST") or default_gateway() or "127.0.0.1"
 MPD_PORT = int(os.environ.get("MPD_PORT", "6600"))
+
+# The FM radio service (tools/fm-radio) runs on the host next to MPD. MPD
+# plays its stream at localhost; we ask it for stations and RDS over the
+# gateway, like MPD.
+FM_URL = "http://localhost:8001/fm"
+FM_API = f"http://{MPD_HOST}:8001"
+
+
+def fm_api(path, timeout=1.0):
+    """GET a JSON answer from the FM service; None if it isn't running."""
+    try:
+        with urllib.request.urlopen(FM_API + path, timeout=timeout) as r:
+            return json.load(r)
+    except (OSError, ValueError):
+        return None
 
 
 class Mpd:
@@ -316,7 +334,28 @@ def devices(sys_block="/sys/class/block"):
                     break
         except OSError:
             pass
+    if fm_present():
+        mask |= DEV_FM
     return mask
+
+
+def fm_present(sys_usb="/sys/bus/usb/devices"):
+    """An RTL-SDR stick on USB (its vendor:product in /sys)."""
+    try:
+        names = os.listdir(sys_usb)
+    except OSError:
+        return False
+    for name in names:
+        try:
+            with open(os.path.join(sys_usb, name, "idVendor")) as f:
+                vendor = f.read().strip()
+            with open(os.path.join(sys_usb, name, "idProduct")) as f:
+                product = f.read().strip()
+        except OSError:
+            continue
+        if (vendor, product) in FM_USB_IDS:
+            return True
+    return False
 
 
 def cd_uri(n):
@@ -370,9 +409,16 @@ def describe_format(song, status, codec=None):
     return codec
 
 
-def describe_track(song, status, radio, codec=None):
-    """Everything the trk message carries, as a tuple."""
+def describe_track(song, status, radio, codec=None, fm=None):
+    """Everything the trk message carries, as a tuple. `fm`: the FM
+    service's status, when the FM stream is playing."""
     path = song.get("file", "")
+    if path == FM_URL:
+        fm = fm or {}
+        mhz = f"{fm['mhz']:.1f} MHz" if fm.get("mhz") else "FM"
+        station = fm.get("ps") or mhz
+        title = fm.get("title") or station
+        return ("FM", mhz, fm.get("artist", ""), title, station, 0, 0, 0, 0, 1)
     fmt = describe_format(song, status, codec)
     if not path:
         return ("MPD", "", "", "", "", 0, 0, 0, 0, 0)
@@ -429,6 +475,12 @@ def describe_status(status):
     song = int(status["song"]) if status.get("song", "").isdigit() else -1
     return (state, elapsed, volume, int(status.get("repeat", 0) == "1"),
             int(status.get("random", 0) == "1"), song)
+
+
+def fm_scan_text(scan):
+    if scan.get("phase") == "sweep":
+        return "Scanning the band..."
+    return f"Scanning {scan['step']}/{scan['of']}: {scan['mhz']:.1f} MHz"
 
 
 def local_minutes():
@@ -492,7 +544,8 @@ class Controller:
             status = self.mpd.command("status")
             song = self.mpd.command("currentsong")
             codec = self._cue_codec(song.get("file", ""))
-        trk = describe_track(song, status, self.radio, codec)
+        fm = fm_api("/status") if song.get("file") == FM_URL else None
+        trk = describe_track(song, status, self.radio, codec, fm)
         if force or trk != self.last_trk:
             src, fmt, artist, title, album, *nums = trk
             self.send("trk", fit(src, LIMITS["src"]), fit(fmt, LIMITS["fmt"]),
@@ -645,7 +698,9 @@ class Controller:
             rows = []
             for i, song in enumerate(songs):
                 path = song["file"]
-                if path.startswith(("http://", "https://")):
+                if path == FM_URL:
+                    text = "FM radio"
+                elif path.startswith(("http://", "https://")):
                     text = self.radio.get(path) or song.get("Name") or path
                 else:
                     artist, title = song.get("Artist", ""), song.get("Title", "")
@@ -668,6 +723,8 @@ class Controller:
             with self.lock:
                 playing = self.mpd.command("currentsong").get("file", "")
             return [(CURRENT if url == playing else " ") + name for url, name in self.radio.items()]
+        if lst == L_FM:
+            return self._fm_rows()
         if lst == L_CD:
             count = self._cd_tracks()
             if not count:
@@ -677,6 +734,58 @@ class Controller:
             return [" Play disc"] + [(CURRENT if playing == cd_uri(n) else " ") + f"Track {n}"
                                      for n in range(1, count + 1)]
         return []
+
+    # --- FM ---
+    # Rows: the stations, then "Scan". While scanning, one row with the progress.
+    def _fm_rows(self):
+        status = fm_api("/status")
+        if status is None:
+            return [" FM service not running"]
+        if status.get("scan"):
+            return [" " + fm_scan_text(status["scan"])]
+        stations = fm_api("/stations") or []
+        with self.lock:
+            on_fm = self.mpd.command("currentsong").get("file") == FM_URL
+        rows = []
+        for st in stations:
+            mark = CURRENT if on_fm and abs(st["mhz"] - status.get("mhz", 0)) < 0.01 else " "
+            rows.append(f"{mark}{st['mhz']:5.1f}  {st['name']}")
+        return rows + [" Scan for stations"]
+
+    def _fm_select(self, index, action):
+        status = fm_api("/status")
+        if status is None or status.get("scan"):
+            return
+        stations = fm_api("/stations") or []
+        if index == len(stations):
+            if action == 0 and (fm_api("/scan") or {}).get("started"):
+                threading.Thread(target=self._fm_scan_watch, daemon=True).start()
+            return
+        if index > len(stations) or action != 0:
+            return
+        fm_api(f"/tune?f={stations[index]['mhz']}", timeout=5)
+        with self.lock:
+            if self.mpd.command("currentsong").get("file") != FM_URL:
+                self.mpd.batch(["clear", f"add {quote(FM_URL)}", "play 0"])
+            elif self.mpd.command("status").get("state") != "play":
+                self.mpd.command("play")
+        self.push(force=True)
+
+    def _fm_scan_watch(self):
+        """Show the scan's progress in the FM list (if it is open: the sketch
+        drops rows for a list that isn't), then the stations found."""
+        while True:
+            status = fm_api("/status")
+            scan = status.get("scan") if status else None
+            if not scan:
+                break
+            self.send("page", L_FM, 0, 0, 1)
+            self.send("item", L_FM, 0, 0, fit(" " + fm_scan_text(scan), ITEM_LIMIT))
+            time.sleep(1)
+        rows = self._fm_rows()
+        self.send("page", L_FM, 0, 0, len(rows))
+        for i in range(min(PAGE, len(rows))):
+            self.send("item", L_FM, 0, i, fit(rows[i], ITEM_LIMIT))
 
     def _cd_tracks(self):
         """Audio tracks on the disc, 0 if there is none. MPD can play
@@ -739,6 +848,9 @@ class Controller:
         return []
 
     def _select(self, lst, ctx, index, action):
+        if lst == L_FM:
+            self._fm_select(index, action)
+            return
         if lst == L_CD:
             count = self._cd_tracks()
             if not count or index > count:

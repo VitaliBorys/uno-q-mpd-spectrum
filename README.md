@@ -15,8 +15,9 @@ whatever MPD is playing — CDs, FLAC/WAV files, CUE images or internet radio.
 - Three more views: a 32-band tape-deck spectrum with peak hold, two VU meters, a
   6E1P-style magic eye
 - Knob: volume; press: play/pause; hold: next track (repeats every second)
-- Menu: queue, artists, albums, internet radio, audio CD, the USB stick with CD rips
-  (CD and USB are greyed out while the drive or the stick is not plugged in)
+- Menu: queue, artists, albums, internet radio, FM radio (an RTL-SDR stick,
+  `tools/fm-radio`), audio CD, the USB stick with CD rips (FM, CD and USB are
+  greyed out while their device is not plugged in)
 - Settings menu: screen brightness, 16 or 32 spectrum bars, peaks that fade or
   fall, when the rain starts, LED matrix brightness, sensitivity, start view
 - Latin and Cyrillic titles; long titles scroll back and forth
@@ -248,6 +249,8 @@ sketch/sketch.ino        LED matrix, TFT screens, encoder and buttons
 sketch/font5x7*.h        5×7 pixel font: Latin (Adafruit), Cyrillic, rain glyphs
 tools/cdrom-modules/     builds the CD drivers the UNO Q kernel leaves out
 tools/spi-bench/         TFT fill speed: Zephyr's SPI driver vs. direct registers
+tools/fm-radio/          FM radio service: RTL-SDR -> HTTP stream for MPD, RDS, scan
+tools/test-signals/      test tracks for the analyzer, and an offline check
 radio.txt                internet radio stations for the menu
 ```
 
