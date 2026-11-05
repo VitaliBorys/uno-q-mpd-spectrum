@@ -39,6 +39,7 @@ class StereoDecoder:
         lp = 2 * cutoff * np.sinc(2 * cutoff * n) * np.blackman(TAPS)
         lp /= lp.sum()
         self.h = (lp * np.exp(2j * np.pi * PILOT_HZ / rate * n)).astype(np.complex64)
+        self.H = {}                  # the filter's spectrum, per FFT size
         self.hist = np.zeros(TAPS - 1, dtype=np.float32)   # the filter's memory
         self.blend = 0.0             # 0 mono .. 1 stereo, follows the pilot
         self.pilot = 0.0             # last pilot amplitude, for /status
@@ -50,7 +51,12 @@ class StereoDecoder:
             return b""
         buf = np.concatenate((self.hist, x))
         self.hist = buf[-(TAPS - 1):]
-        z = np.convolve(buf, self.h, mode="valid")          # pilot phasor, len(x)
+        # The filter by FFT (overlap-save): np.convolve with 255 complex taps
+        # took ~40 % of a core on the board, this a fraction of it.
+        nfft = 1 << (len(buf) - 1).bit_length()
+        if nfft not in self.H:
+            self.H[nfft] = np.fft.fft(self.h, nfft).astype(np.complex64)
+        z = np.fft.ifft(np.fft.fft(buf, nfft) * self.H[nfft])[TAPS - 1:len(buf)]   # pilot phasor
         mpx = buf[(TAPS - 1) // 2:(TAPS - 1) // 2 + len(x)]  # same delay as the filter
         power = np.abs(z) ** 2
         self.pilot = float(2 * np.sqrt(np.mean(power)))     # the pilot's amplitude

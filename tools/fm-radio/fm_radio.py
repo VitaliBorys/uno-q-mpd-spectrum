@@ -55,7 +55,8 @@ CONFIG = os.path.expanduser("~/.config/fm-radio")
 STATE = os.path.join(CONFIG, "state.json")
 STATIONS = os.path.join(CONFIG, "stations.txt")
 SCAN_NAMES = os.path.join(CONFIG, "scan-names.json")   # what the last scan named them
-CHUNK = 4096                 # bytes per read
+CHUNK = 4096                 # bytes per read (audio, RDS)
+MPX_CHUNK = 16384            # bytes per read from rtl_fm: ~48 ms, bigger FFTs for stereo
 BUFFER_S = 2.0               # audio kept for a listener that falls behind
 
 # Scan: a sweep of the band, then RDS on every peak for the station's name.
@@ -261,7 +262,7 @@ class Radio:
         said = False
         odd = b""                    # a read can end mid-sample
         while gen == self.gen:
-            data = rtl.stdout.read(CHUNK)
+            data = rtl.stdout.read(MPX_CHUNK)
             if not data:
                 break
             data, odd = odd + data, b""
