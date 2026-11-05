@@ -30,6 +30,8 @@ import os
 import re
 import select
 import shutil
+import signal
+import socket
 import statistics
 import subprocess
 import tempfile
@@ -69,6 +71,9 @@ SCAN_NO_RDS_S = 3            # ...or less if no RDS at all shows up by then
 SCAN_PS_SURE = 3             # the same name this many times: done early
 
 CHANNELS = 2 if StereoDecoder else 1
+MPD = ("127.0.0.1", 6600)
+STREAM_URL = f"http://localhost:{PORT}/fm"   # what MPD has in its queue
+
 AUDIO_BYTES_S = AUDIO_RATE * 2 * CHANNELS
 MIME = f"audio/L16;rate={AUDIO_RATE};channels={CHANNELS}"   # raw PCM, MPD's pcm decoder
 
@@ -164,16 +169,55 @@ class Radio:
     def _load(self):
         try:
             with open(STATE) as f:
-                return float(json.load(f)["mhz"])
+                state = json.load(f)
+            self.was_listened = bool(state.get("listened"))
+            return float(state["mhz"])
         except (OSError, ValueError, KeyError):
+            self.was_listened = False
             return DEFAULT_MHZ
 
-    def _save(self):
+    def _save(self, listened=False):
         os.makedirs(CONFIG, exist_ok=True)
         tmp = STATE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"mhz": self.mhz}, f)
+            json.dump({"mhz": self.mhz, "listened": listened}, f)
         os.replace(tmp, STATE)
+
+    def shutdown(self):
+        """Stopping (systemctl stop/restart): remember whether MPD was
+        listening, so the next start can bring it back."""
+        with self.lock:
+            listened = self.listeners > 0
+        self._save(listened)
+        self.stop()
+
+    def resume_mpd(self):
+        """At start: if MPD was listening when we stopped, its stream broke
+        and it stopped. If FM is still what it has, play it again."""
+        if not self.was_listened:
+            return
+        self._save()
+        try:
+            with socket.create_connection(MPD, timeout=5) as sock:
+                f = sock.makefile("rw", encoding="utf-8", newline="\n")
+                f.readline()                          # OK MPD ...
+
+                def cmd(c):
+                    f.write(c + "\n")
+                    f.flush()
+                    out = {}
+                    for line in f:
+                        line = line.rstrip("\n")
+                        if line == "OK" or line.startswith("ACK"):
+                            return out
+                        k, _, v = line.partition(": ")
+                        out.setdefault(k, v)
+                    return out
+                if cmd("currentsong").get("file") == STREAM_URL and cmd("status").get("state") != "play":
+                    cmd("play")
+                    log("MPD was listening before the restart: playing again")
+        except OSError as exc:
+            log(f"MPD: {exc}")
 
     def status(self):
         # The name from the station list: many stations rotate words in their
@@ -551,6 +595,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
 
+def on_sigterm(*_):
+    raise KeyboardInterrupt
+
+
 def main():
     for tool in ("rtl_fm", "rtl_power", "sox"):
         if not shutil.which(tool):
@@ -558,12 +606,15 @@ def main():
     server = ThreadingHTTPServer((BIND, PORT), Handler)
     server.daemon_threads = True
     log(f"listening on {BIND}:{PORT}, {radio.mhz} MHz")
+    # systemd stops us with SIGTERM: leave through the finally below.
+    signal.signal(signal.SIGTERM, on_sigterm)
+    threading.Thread(target=radio.resume_mpd, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        radio.stop()
+        radio.shutdown()
 
 
 if __name__ == "__main__":
