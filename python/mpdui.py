@@ -418,7 +418,8 @@ def describe_track(song, status, radio, codec=None, fm=None):
         mhz = f"{fm['mhz']:.1f} MHz" if fm.get("mhz") else "FM"
         station = fm.get("name") or fm.get("ps") or mhz
         title = fm.get("title") or station
-        return ("FM", mhz, fm.get("artist", ""), title, station, 0, 0, 0, 0, 1)
+        fmt = mhz + (" ST" if fm.get("stereo") else "")       # "107.5 MHz ST"
+        return ("FM", fmt, fm.get("artist", ""), title, station, 0, 0, 0, 0, 1)
     fmt = describe_format(song, status, codec)
     if not path:
         return ("MPD", "", "", "", "", 0, 0, 0, 0, 0)

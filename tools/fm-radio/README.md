@@ -8,17 +8,20 @@ analyzer and the VU meters all work.
 ```
 RTL-SDR -> rtl_fm (FM demodulation, MPX at 171 kHz)
              |-> redsea -> RDS: station name, radiotext
-             '-> sox: 15 kHz low-pass, 50 us de-emphasis, 48 kHz
-                   -> http://localhost:8001/fm (audio/L16) -> MPD
+             '-> stereo.py: left/right from the 19 kHz pilot (numpy)
+                   -> sox: 15 kHz low-pass, 50 us de-emphasis, 48 kHz
+                        -> http://localhost:8001/fm (audio/L16) -> MPD
 ```
 
 The tuner runs only while MPD listens to the stream, and stops 10 s after
-it disconnects. Mono for now.
+it disconnects. Stereo when the station sends the pilot and it is strong
+enough, else mono ("ST" next to the frequency on the screen). Without
+numpy (`sudo apt install python3-numpy`) always mono.
 
 ## Setup
 
 ```sh
-sudo apt install rtl-sdr sox
+sudo apt install rtl-sdr sox python3-numpy
 sudo usermod -aG plugdev arduino     # USB access to the stick; log in again
 rtl_test -t                          # should find the R820T tuner
 ```

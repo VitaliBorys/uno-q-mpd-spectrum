@@ -7,8 +7,9 @@ service fm-radio.service. Plain Python, no numpy.
 
     RTL-SDR -> rtl_fm (FM demodulation, MPX at 171 kHz)
                  |-> redsea -> RDS: station name (PS), radiotext (RT)
-                 '-> sox: 15 kHz low-pass, 50 us de-emphasis, 48 kHz
-                       -> HTTP audio/L16 -> MPD
+                 '-> stereo.py (numpy): L/R from the 19 kHz pilot
+                       -> sox: 15 kHz low-pass, 50 us de-emphasis, 48 kHz
+                            -> HTTP audio/L16 -> MPD
 
 HTTP on port 8001:
     /fm              the audio stream (MPD plays http://localhost:8001/fm)
@@ -19,7 +20,8 @@ HTTP on port 8001:
                      ~/.config/fm-radio/stations.txt, "107.5 | Radio ZET" per
                      line: edit the names there, a new scan keeps them
 
-The tuner only runs while someone (MPD) is listening to /fm. Mono for now.
+The tuner only runs while someone (MPD) is listening to /fm. Without numpy
+(sudo apt install python3-numpy) the sound is mono.
 """
 
 import collections
@@ -35,6 +37,11 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+try:
+    from stereo import StereoDecoder
+except ImportError:              # no numpy: mono
+    StereoDecoder = None
 
 PORT = 8001
 BIND = "0.0.0.0"             # the App Lab container asks /status over the docker gateway
@@ -60,8 +67,9 @@ SCAN_RDS_S = 10              # how long to listen for a station's name...
 SCAN_NO_RDS_S = 3            # ...or less if no RDS at all shows up by then
 SCAN_PS_SURE = 3             # the same name this many times: done early
 
-AUDIO_BYTES_S = AUDIO_RATE * 2
-MIME = f"audio/L16;rate={AUDIO_RATE};channels=1"   # raw PCM, MPD's pcm decoder
+CHANNELS = 2 if StereoDecoder else 1
+AUDIO_BYTES_S = AUDIO_RATE * 2 * CHANNELS
+MIME = f"audio/L16;rate={AUDIO_RATE};channels={CHANNELS}"   # raw PCM, MPD's pcm decoder
 
 # Radiotext often rotates "now playing", "next" and a slogan. Only the first
 # is the song. RadioText+ (tags), when a station sends it, says it exactly.
@@ -143,9 +151,12 @@ class Radio:
         self.rds = {}
         self.song = ("", "")         # artist, title on air (RT+ or radiotext)
         self.scan = None             # progress while scanning
+        self.decoder = None          # the stereo decoder of the running pipeline
         self.redsea = shutil.which("redsea")
         if not self.redsea:
             log("redsea not found: no RDS")
+        if not StereoDecoder:
+            log("numpy not found: mono")
         threading.Thread(target=self._idle_watch, daemon=True).start()
 
     # --- state -----------------------------------------------------------
@@ -173,7 +184,9 @@ class Radio:
                     "ps": self.rds.get("ps", "").strip(),
                     "rt": self.rds.get("radiotext", "").strip(),
                     "artist": self.song[0], "title": self.song[1],
-                    "pi": self.rds.get("pi", ""), "scan": self.scan}
+                    "pi": self.rds.get("pi", ""), "scan": self.scan,
+                    "stereo": bool(self.decoder and self.decoder.blend > 0.5),
+                    "pilot": round(self.decoder.pilot, 4) if self.decoder else 0}
 
     # --- the pipeline ----------------------------------------------------
     def start(self):
@@ -190,11 +203,13 @@ class Radio:
             # De-emphasis 50 us = a first-order low-pass at 3183 Hz; above 15 kHz
             # there's the 19 kHz pilot, stereo and RDS, not sound. The output is
             # big-endian, as audio/L16 is.
+            ch = str(CHANNELS)
             sox = subprocess.Popen(
                 ["sox", "-q", "-t", "raw", "-r", str(MPX_RATE), "-e", "signed", "-b", "16",
-                 "-c", "1", "-", "-t", "raw", "-r", str(AUDIO_RATE), "-e", "signed",
-                 "-b", "16", "-B", "-c", "1", "-", "sinc", "-15k", "lowpass", "-1", "3183"],
+                 "-c", ch, "-", "-t", "raw", "-r", str(AUDIO_RATE), "-e", "signed",
+                 "-b", "16", "-B", "-c", ch, "-", "sinc", "-15k", "lowpass", "-1", "3183"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            self.decoder = StereoDecoder(MPX_RATE) if StereoDecoder else None
             self.procs = [rtl, sox]
             red = None
             if self.redsea:
@@ -214,6 +229,7 @@ class Radio:
             procs, self.procs = self.procs, []
             self.gen += 1
             self.rds, self.song = {}, ("", "")
+            self.decoder = None
         for p in procs:
             try:
                 if p.stdin:
@@ -240,16 +256,26 @@ class Radio:
             self.start()
 
     def _pump(self, gen, rtl, sox, red):
-        """rtl_fm's MPX to sox (sound) and redsea (RDS)."""
+        """rtl_fm's MPX to the stereo decoder and sox (sound), and redsea (RDS)."""
+        decoder = self.decoder
+        said = False
+        odd = b""                    # a read can end mid-sample
         while gen == self.gen:
             data = rtl.stdout.read(CHUNK)
             if not data:
                 break
-            for p in (sox, red):
+            data, odd = odd + data, b""
+            if len(data) % 2:
+                data, odd = data[:-1], data[-1:]
+            sound = decoder.process(data) if decoder else data
+            if decoder and not said and decoder.blend >= 1:
+                said = True
+                log(f"stereo, pilot {decoder.pilot:.3f}")
+            for p, b in ((sox, sound), (red, data)):
                 if p is None:
                     continue
                 try:
-                    p.stdin.write(data)
+                    p.stdin.write(b)
                     p.stdin.flush()
                 except (BrokenPipeError, ValueError, OSError):
                     pass
