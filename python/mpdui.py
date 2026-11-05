@@ -418,7 +418,8 @@ def describe_track(song, status, radio, codec=None, fm=None):
         mhz = f"{fm['mhz']:.1f} MHz" if fm.get("mhz") else "FM"
         station = fm.get("name") or fm.get("ps") or mhz
         title = fm.get("title") or station
-        fmt = mhz + (" ST" if fm.get("stereo") else "")       # "107.5 MHz ST"
+        # The header has room for 11 characters: "107.5 ST" / "107.5 MONO"
+        fmt = (f"{fm['mhz']:.1f} " + ("ST" if fm.get("stereo") else "MONO")) if fm.get("mhz") else "FM"
         return ("FM", fmt, fm.get("artist", ""), title, station, 0, 0, 0, 0, 1)
     fmt = describe_format(song, status, codec)
     if not path:
