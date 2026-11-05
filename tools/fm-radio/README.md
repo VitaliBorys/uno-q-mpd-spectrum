@@ -72,4 +72,10 @@ curl localhost:8001/scan             # stops the sound for the scan
 - `rtl_fm` takes ~60-70 % of one core.
 - Don't let `rtl_fm` resample to 48 kHz itself (`-r`) from a rate that
   isn't a whole multiple: its resampler whistles. sox does it here.
+- Walkie-talkies (narrow FM, e.g. PMR446 channel 1) by hand, with the
+  service stopped (`sudo systemctl stop fm-radio`: one program at a time
+  can use the stick). Here `-r 48k` gave pure silence, so sox resamples:
+  `rtl_fm -M fm -f 446.00625M -s 16k -l 50 -E pad -g 40 - | sox -t raw -r 16k
+  -e signed -b 16 -c 1 - -t raw -r 48k - vol 3 | aplay -D plughw:CARD=QCC5125
+  -r 48000 -f S16_LE -t raw -c 1` (`-l` squelch, `-E pad` zeros while closed).
 - While MPD is paused it keeps the connection, so the tuner keeps running.
