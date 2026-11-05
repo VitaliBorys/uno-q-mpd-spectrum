@@ -1,0 +1,61 @@
+# FM radio (RTL-SDR)
+
+An RTL-SDR stick (tested: RTL-SDR Blog V3, R820T2) as one more source for
+MPD. A small service on the board tunes the stick and serves the sound as an
+HTTP stream, so MPD treats it like internet radio: the knob, pause, the
+analyzer and the VU meters all work.
+
+```
+RTL-SDR -> rtl_fm (FM demodulation, MPX at 171 kHz)
+             |-> redsea -> RDS: station name, radiotext
+             '-> sox: 15 kHz low-pass, 50 us de-emphasis, 48 kHz
+                   -> http://localhost:8001/fm (audio/L16) -> MPD
+```
+
+The tuner runs only while MPD listens to the stream, and stops 10 s after
+it disconnects. Mono for now.
+
+## Setup
+
+```sh
+sudo apt install rtl-sdr sox
+sudo usermod -aG plugdev arduino     # USB access to the stick; log in again
+rtl_test -t                          # should find the R820T tuner
+```
+
+RDS needs redsea (not in Debian), built from source:
+
+```sh
+sudo apt install git meson g++ libliquid-dev libsndfile1-dev nlohmann-json3-dev
+git clone https://github.com/windytan/redsea.git ~/redsea
+cd ~/redsea && meson setup build && meson compile -C build && sudo meson install -C build
+```
+
+Without redsea the radio plays, just without station names.
+
+The service:
+
+```sh
+sudo cp ~/ArduinoApps/spectrum/tools/fm-radio/fm-radio.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now fm-radio
+journalctl -u fm-radio -f            # its log
+```
+
+## Try it
+
+```sh
+curl "localhost:8001/tune?f=107.5"   # MHz
+mpc clear; mpc add http://localhost:8001/fm; mpc play
+curl localhost:8001/status           # frequency, RDS name and text
+```
+
+Finding stations: `rtl_power -f 87.5M:108M:100k -g 30 -i 10 -1 fm.csv`
+(the service must not be playing: one program at a time can use the stick).
+
+## Notes
+
+- `rtl_fm` takes ~60-70 % of one core.
+- Don't let `rtl_fm` resample to 48 kHz itself (`-r`) from a rate that
+  isn't a whole multiple: its resampler whistles. sox does it here.
+- While MPD is paused it keeps the connection, so the tuner keeps running.

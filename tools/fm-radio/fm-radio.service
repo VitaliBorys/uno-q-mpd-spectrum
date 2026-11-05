@@ -1,0 +1,13 @@
+[Unit]
+Description=FM radio (RTL-SDR) as an HTTP stream for MPD
+After=network.target
+
+[Service]
+User=arduino
+SupplementaryGroups=plugdev
+ExecStart=/usr/bin/python3 /home/arduino/ArduinoApps/spectrum/tools/fm-radio/fm_radio.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
