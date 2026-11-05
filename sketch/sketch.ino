@@ -1907,6 +1907,8 @@ void applyMenuItem(const InItem &it) {
   if (!inMenu || idle) return;
   Level &l = st[depth];
   if (it.list != l.id || it.ctx != l.ctx) return;           // an old answer
+  // The FM scan's progress arrives every second: the screen is in use, no rain.
+  if (l.id == L_FM) lastInputAt = millis();
   if (it.kind == 0) {
     bool changed = it.total != l.total;
     l.total = it.total;
