@@ -164,8 +164,11 @@ class Radio:
         os.replace(tmp, STATE)
 
     def status(self):
+        # The name from the station list: many stations rotate words in their
+        # RDS name ("RMF" / "Classic"), which would make the screen flicker.
+        name = dict(load_stations()).get(round(self.mhz, 2), "")
         with self.lock:
-            return {"mhz": self.mhz, "running": bool(self.procs),
+            return {"mhz": self.mhz, "running": bool(self.procs), "name": name,
                     "listeners": self.listeners,
                     "ps": self.rds.get("ps", "").strip(),
                     "rt": self.rds.get("radiotext", "").strip(),
@@ -300,7 +303,7 @@ class Radio:
                     break
                 for k in ("pi", "ps", "radiotext", "prog_type"):
                     if k in g:
-                        if k == "ps" and g[k] != self.rds.get(k):
+                        if k == "ps" and "ps" not in self.rds:     # once per tuning
                             log(f"station: {g[k].strip()}")
                         self.rds[k] = g[k]
                 if song and song != self.song:
